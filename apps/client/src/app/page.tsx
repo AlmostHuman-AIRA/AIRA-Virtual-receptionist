@@ -13,9 +13,11 @@ export default function Home() {
       <div className="container mx-auto px-4 py-8">
         {/* Header */}
         <div className="mb-8 text-center">
-          <h1 className="mb-2 text-4xl font-bold text-gray-900">TalkMateAI</h1>
+          <h1 className="mb-2 text-4xl font-bold text-gray-900">
+            AlmostHuman AI
+          </h1>
           <p className="text-lg text-gray-600">
-            Voice-controlled avatar with real-time responses
+            An AI-Based Virtual Receptionist System
           </p>
         </div>
 

@@ -375,8 +375,8 @@ const TalkingHead: React.FC<TalkingHeadProps> = ({
 
   const loadAvatar = async (gender: string = 'F') => {
     const avatarUrls = {
-      F: 'https://models.readyplayer.me/64bfa15f0e72c63d7c3934a6.glb?morphTargets=ARKit,Oculus+Visemes,mouthOpen,mouthSmile,eyesClosed,eyesLookUp,eyesLookDown&textureSizeLimit=1024&textureFormat=png',
-      M: 'https://models.readyplayer.me/638df5d0d72bffc6fa179441.glb'
+      F: '/avatars/human.glb',
+      M: '/avatars/human.glb'
     };
 
     try {
@@ -415,7 +415,7 @@ const TalkingHead: React.FC<TalkingHeadProps> = ({
       <CardContent className="space-y-6">
         {/* Avatar Display */}
         <div
-          className="relative overflow-hidden rounded-lg bg-gradient-to-br from-gray-100 to-gray-200"
+          className="relative overflow-hidden rounded-lg bg-black"
           style={{ height: '500px' }}
         >
           <div ref={avatarRef} className="h-full w-full" />
