@@ -7,8 +7,6 @@ logger = logging.getLogger(__name__)
 
 
 class WhisperProcessor:
-    """Handles speech-to-text using faster-whisper model"""
-
     _instance = None
 
     @classmethod
@@ -25,42 +23,74 @@ class WhisperProcessor:
             compute_type="int8",
             cpu_threads=4,
         )
+        # Threshold for raw audio volume (0.0 to 1.0)
+        # If the average volume is below this, we don't even transcribe.
+        self.MIN_ENERGY_THRESHOLD = 0.005
+
+        # Common Whisper hallucinations during silence
+
         logger.info("faster-whisper model ready for transcription")
         self.transcription_count = 0
 
     async def transcribe_audio(self, audio_bytes):
-        """Transcribe audio bytes to text using faster-whisper with VAD."""
         try:
-            # Convert 16-bit PCM audio bytes to float32 numpy array in [-1.0, 1.0]
             audio_array = (
                 np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
             )
 
+            # LAYER 1 — RMS Filter
+            rms = np.sqrt(np.mean(audio_array**2))
+            if rms < self.MIN_ENERGY_THRESHOLD:
+                logger.info(f"Skipping transcription: Audio too quiet (RMS: {rms:.5f})")
+                return "NO_SPEECH"
+
             loop = asyncio.get_event_loop()
 
             def _run_transcription():
-                segments, _info = self.model.transcribe(
+
+                segments, info = self.model.transcribe(
                     audio_array,
                     vad_filter=True,
+                    vad_parameters=dict(min_silence_duration_ms=500),
+                    no_speech_threshold=0.6,
+                    log_prob_threshold=-1.0,
+                    beam_size=5,
                 )
-                # segments is a generator; materialize to list to safely iterate twice
-                return " ".join(segment.text for segment in segments).strip()
+
+                # 🔴 ADD LANGUAGE GATE HERE
+                if info.language_probability < 0.88:
+                    logger.info(
+                        f"Low language probability: {info.language_probability:.3f}"
+                    )
+                    return ""
+
+                valid_text = []
+
+                for segment in segments:
+
+                    if segment.no_speech_prob > 0.6:
+                        continue
+
+                    if segment.avg_logprob < -1.0:
+                        continue
+
+                    if (segment.end - segment.start) < 0.5:
+                        continue
+
+                    valid_text.append(segment.text)
+
+                return " ".join(valid_text).strip()
 
             transcribed_text = await loop.run_in_executor(None, _run_transcription)
-            self.transcription_count += 1
 
+            # Final safety check
+            if not transcribed_text:
+                return "NO_SPEECH"
+
+            self.transcription_count += 1
             logger.info(
                 f"Transcription #{self.transcription_count}: '{transcribed_text}'"
             )
-
-            # Check for noise/empty transcription
-            if not transcribed_text or len(transcribed_text) < 3:
-                return "NO_SPEECH"
-
-            # Check for common noise indicators
-            noise_indicators = ["thank you", "thanks for watching", "you", ".", ""]
-            if transcribed_text.lower().strip() in noise_indicators:
-                return "NOISE_DETECTED"
 
             return transcribed_text
 

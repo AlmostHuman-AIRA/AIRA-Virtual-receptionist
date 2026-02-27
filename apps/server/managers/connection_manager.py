@@ -4,8 +4,6 @@ from datetime import datetime
 from typing import Dict
 from fastapi import WebSocket
 
-from .image_manager import ImageManager
-
 logger = logging.getLogger(__name__)
 
 
@@ -17,13 +15,9 @@ class ConnectionManager:
         self.active_connections: Dict[str, WebSocket] = {}
         # Track current processing tasks for each client
         self.current_tasks: Dict[str, Dict[str, asyncio.Task]] = {}
-        # Add image manager
-        self.image_manager = ImageManager()
-        # Track statistics
+        # Track statistics (voice-only)
         self.stats = {
             "audio_segments_received": 0,
-            "images_received": 0,
-            "audio_with_image_received": 0,
             "last_reset": datetime.now(),
         }
 
