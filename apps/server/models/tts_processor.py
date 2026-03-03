@@ -1,13 +1,20 @@
 import asyncio
 import logging
 import numpy as np
-from kokoro import KPipeline
 
+try:
+    from kokoro import KPipeline
+except ImportError:
+    KPipeline = None
+    print("⚠️ Kokoro TTS not installed. TTS disabled.")
 logger = logging.getLogger(__name__)
 
 
 class KokoroTTSProcessor:
-    """Handles text-to-speech conversion using Kokoro model"""
+    def __init__(self):
+        if KPipeline is None:
+            raise RuntimeError("Kokoro TTS not available")
+        self.pipeline = KPipeline()
 
     _instance = None
 

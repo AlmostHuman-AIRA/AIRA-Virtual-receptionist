@@ -7,8 +7,8 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from managers.connection_manager import manager
 from models.whisper_processor import WhisperProcessor
-from models.ollama_processor import OllamaProcessor
 from models.tts_processor import KokoroTTSProcessor
+from services.query_router import route_query
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +22,6 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
 
     # Get instances of processors
     whisper_processor = WhisperProcessor.get_instance()
-    ollama_processor = OllamaProcessor.get_instance()
     tts_processor = KokoroTTSProcessor.get_instance()
 
     # Per-connection text queue
@@ -98,15 +97,15 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                 logger.info("WebSocket connection closed during listener loop")
 
         async def brain():
-            """Consume transcribed text, get LLM response, synthesize TTS, and send audio."""
+            """Consume transcribed text, route through query_router, synthesize TTS, and send audio."""
             try:
                 while True:
                     text = await text_queue.get()
                     manager.client_state[client_id] = "THINKING"
 
-                    # Get LLM response from Ollama
-                    reply_text = await ollama_processor.get_response(text)
-                    logger.info(f"Ollama reply: '{reply_text}'")
+                    # Route query through intent detection + DB grounding + LLM
+                    reply_text = await route_query(text)
+                    logger.info(f"Grounded reply: '{reply_text}'")
 
                     # Synthesize speech with Kokoro TTS (non-blocking)
                     audio, word_timings = await tts_processor.synthesize_initial_speech_with_timing(  # type: ignore[attr-defined]

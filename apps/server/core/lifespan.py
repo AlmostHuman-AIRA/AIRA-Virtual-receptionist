@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
@@ -5,6 +6,9 @@ from fastapi import FastAPI
 from models.whisper_processor import WhisperProcessor
 from models.ollama_processor import OllamaProcessor
 from models.tts_processor import KokoroTTSProcessor
+from receptionist.database import engine
+from receptionist.models import Base
+from receptionist.seed_data import seed_database
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +22,16 @@ async def lifespan(app: FastAPI):
         whisper_processor = WhisperProcessor.get_instance()
         ollama_processor = OllamaProcessor.get_instance()
         tts_processor = KokoroTTSProcessor.get_instance()
+
+        # Initialize receptionist database (SQLite)
+        loop = asyncio.get_running_loop()
+
+        def _init_db():
+            Base.metadata.create_all(bind=engine)
+            seed_database()
+
+        await loop.run_in_executor(None, _init_db)
+
         logger.info("All models initialized successfully")
     except Exception as e:
         logger.error(f"Error initializing models: {e}")

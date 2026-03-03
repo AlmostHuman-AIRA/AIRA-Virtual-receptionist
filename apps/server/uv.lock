@@ -514,6 +514,21 @@ wheels = [
 ]
 
 [[package]]
+name = "greenlet"
+version = "3.3.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/a3/51/1664f6b78fc6ebbd98019a1fd730e83fa78f2db7058f72b1463d3612b8db/greenlet-3.3.2.tar.gz", hash = "sha256:2eaf067fc6d886931c7962e8c6bede15d2f01965560f3359b27c80bde2d151f2", size = 188267, upload-time = "2026-02-20T20:54:15.531Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/38/3f/9859f655d11901e7b2996c6e3d33e0caa9a1d4572c3bc61ed0faa64b2f4c/greenlet-3.3.2-cp310-cp310-macosx_11_0_universal2.whl", hash = "sha256:9bc885b89709d901859cf95179ec9f6bb67a3d2bb1f0e88456461bd4b7f8fd0d", size = 277747, upload-time = "2026-02-20T20:16:21.325Z" },
+    { url = "https://files.pythonhosted.org/packages/fb/07/cb284a8b5c6498dbd7cba35d31380bb123d7dceaa7907f606c8ff5993cbf/greenlet-3.3.2-cp310-cp310-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:b568183cf65b94919be4438dc28416b234b678c608cafac8874dfeeb2a9bbe13", size = 579202, upload-time = "2026-02-20T20:47:28.955Z" },
+    { url = "https://files.pythonhosted.org/packages/ed/45/67922992b3a152f726163b19f890a85129a992f39607a2a53155de3448b8/greenlet-3.3.2-cp310-cp310-manylinux_2_24_ppc64le.manylinux_2_28_ppc64le.whl", hash = "sha256:527fec58dc9f90efd594b9b700662ed3fb2493c2122067ac9c740d98080a620e", size = 590620, upload-time = "2026-02-20T20:55:55.581Z" },
+    { url = "https://files.pythonhosted.org/packages/ad/55/9f1ebb5a825215fadcc0f7d5073f6e79e3007e3282b14b22d6aba7ca6cb8/greenlet-3.3.2-cp310-cp310-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:ad0c8917dd42a819fe77e6bdfcb84e3379c0de956469301d9fd36427a1ca501f", size = 591729, upload-time = "2026-02-20T20:20:58.395Z" },
+    { url = "https://files.pythonhosted.org/packages/24/b4/21f5455773d37f94b866eb3cf5caed88d6cea6dd2c6e1f9c34f463cba3ec/greenlet-3.3.2-cp310-cp310-musllinux_1_2_aarch64.whl", hash = "sha256:97245cc10e5515dbc8c3104b2928f7f02b6813002770cfaffaf9a6e0fc2b94ef", size = 1551946, upload-time = "2026-02-20T20:49:31.102Z" },
+    { url = "https://files.pythonhosted.org/packages/00/68/91f061a926abead128fe1a87f0b453ccf07368666bd59ffa46016627a930/greenlet-3.3.2-cp310-cp310-musllinux_1_2_x86_64.whl", hash = "sha256:8c1fdd7d1b309ff0da81d60a9688a8bd044ac4e18b250320a96fc68d31c209ca", size = 1618494, upload-time = "2026-02-20T20:21:06.541Z" },
+    { url = "https://files.pythonhosted.org/packages/ac/78/f93e840cbaef8becaf6adafbaf1319682a6c2d8c1c20224267a5c6c8c891/greenlet-3.3.2-cp310-cp310-win_amd64.whl", hash = "sha256:5d0e35379f93a6d0222de929a25ab47b5eb35b5ef4721c2b9cbcc4036129ff1f", size = 230092, upload-time = "2026-02-20T20:17:09.379Z" },
+]
+
+[[package]]
 name = "h11"
 version = "0.16.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1662,6 +1677,26 @@ wheels = [
 ]
 
 [[package]]
+name = "sqlalchemy"
+version = "2.0.47"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "greenlet", marker = "platform_machine == 'AMD64' or platform_machine == 'WIN32' or platform_machine == 'aarch64' or platform_machine == 'amd64' or platform_machine == 'ppc64le' or platform_machine == 'win32' or platform_machine == 'x86_64'" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/cd/4b/1e00561093fe2cd8eef09d406da003c8a118ff02d6548498c1ae677d68d9/sqlalchemy-2.0.47.tar.gz", hash = "sha256:e3e7feb57b267fe897e492b9721ae46d5c7de6f9e8dee58aacf105dc4e154f3d", size = 9886323, upload-time = "2026-02-24T16:34:27.947Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ec/75/17db77c57129c223c7d98518ad1e1faa24ee350c22a44b55390d8463c28c/sqlalchemy-2.0.47-cp310-cp310-macosx_11_0_arm64.whl", hash = "sha256:33a917ede39406ddb93c3e642b5bc480be7c5fd0f3d0d6ae1036d466fb963f1a", size = 2157331, upload-time = "2026-02-24T16:43:52.693Z" },
+    { url = "https://files.pythonhosted.org/packages/b0/d6/3658f7e5c376de774c009f2bb9c0ddf88a35b89c5bfb15ee7174a17b1a5f/sqlalchemy-2.0.47-cp310-cp310-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:561d027c829b01e040bdade6b6f5b429249d056ef95d7bdcb9211539ecc82803", size = 3236939, upload-time = "2026-02-24T17:28:57.419Z" },
+    { url = "https://files.pythonhosted.org/packages/4e/38/f4b94f85d1c26cb9ee0e57449754de816c326f9586b9a8c5247eb49146de/sqlalchemy-2.0.47-cp310-cp310-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:fa5072a37e68c565363c009b7afa5b199b488c87940ec02719860093a08f34ca", size = 3235190, upload-time = "2026-02-24T17:27:07.884Z" },
+    { url = "https://files.pythonhosted.org/packages/94/f2/36714f1de01e135a2bf142b662e416e5338ab63c47878e31051338c66e2d/sqlalchemy-2.0.47-cp310-cp310-musllinux_1_2_aarch64.whl", hash = "sha256:1e7ed17dd4312a298b6024bfd1baf51654bc49e3f03c798005babf0c7922d6a7", size = 3188064, upload-time = "2026-02-24T17:28:58.908Z" },
+    { url = "https://files.pythonhosted.org/packages/ab/94/fcd978e7625cd1c97d9f1d7363e18e37d24314e572acd7c091e3a4210106/sqlalchemy-2.0.47-cp310-cp310-musllinux_1_2_x86_64.whl", hash = "sha256:6992e353fcb0593eb42d95ad84b3e58fe40b5e37fd332b9ccba28f4b2f36d1fc", size = 3209480, upload-time = "2026-02-24T17:27:09.823Z" },
+    { url = "https://files.pythonhosted.org/packages/23/29/c633202b9900ab65f0162f59df737b57f30010f44d892b186810c9ed58b7/sqlalchemy-2.0.47-cp310-cp310-win32.whl", hash = "sha256:05a6d58ed99ebd01303c92d29a0c9cbf70f637b3ddd155f5172c5a7239940998", size = 2117652, upload-time = "2026-02-24T17:14:34.635Z" },
+    { url = "https://files.pythonhosted.org/packages/00/39/54acf13913932b8508058d47a169e6fcde9adaa4cbfa16cbf30da1f6a482/sqlalchemy-2.0.47-cp310-cp310-win_amd64.whl", hash = "sha256:4a7aa4a584cc97e268c11e700dea0b763874eaebb435e75e7d0ffee5d90f5030", size = 2140883, upload-time = "2026-02-24T17:14:35.875Z" },
+    { url = "https://files.pythonhosted.org/packages/15/9f/7c378406b592fcf1fc157248607b495a40e3202ba4a6f1372a2ba6447717/sqlalchemy-2.0.47-py3-none-any.whl", hash = "sha256:e2647043599297a1ef10e720cf310846b7f31b6c841fee093d2b09d81215eb93", size = 1940159, upload-time = "2026-02-24T17:15:07.158Z" },
+]
+
+[[package]]
 name = "srsly"
 version = "2.5.1"
 source = { registry = "https://pypi.org/simple" }
@@ -1719,6 +1754,7 @@ dependencies = [
     { name = "requests" },
     { name = "scipy" },
     { name = "soundfile" },
+    { name = "sqlalchemy" },
     { name = "torch" },
     { name = "uvicorn" },
     { name = "websockets" },
@@ -1746,6 +1782,7 @@ requires-dist = [
     { name = "requests" },
     { name = "scipy", specifier = "==1.15.2" },
     { name = "soundfile", specifier = "==0.13.1" },
+    { name = "sqlalchemy", specifier = ">=2.0.0" },
     { name = "torch", specifier = "==2.6.0+cu124" },
     { name = "uvicorn", specifier = ">=0.34.3" },
     { name = "websockets" },

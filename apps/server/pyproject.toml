@@ -8,6 +8,7 @@ dependencies = [
     # PyTorch with CUDA support - specific versions
     "torch==2.6.0+cu124",
     # From requirements.txt
+    "sqlalchemy>=2.0.0",
     "soundfile==0.13.1",
     "scipy==1.15.2",
     "backoff==2.2.1",

@@ -18,7 +18,7 @@ class WhisperProcessor:
     def __init__(self):
         logger.info("Initializing faster-whisper model (distil-large-v3, CPU int8)...")
         self.model = WhisperModel(
-            "distil-large-v3",
+            "base",
             device="cpu",
             compute_type="int8",
             cpu_threads=4,
