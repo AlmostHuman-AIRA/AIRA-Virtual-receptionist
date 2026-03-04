@@ -7,9 +7,9 @@ Base = declarative_base()
 
 class Employee(Base):
     __tablename__ = "employees"
-
     id = Column(Integer, primary_key=True)
-    name = Column(String, unique=True)
+    name = Column(String)
+    role = Column(String)  # Add this: "Manager", "Head", "Intern", etc.
     department = Column(String)
     cabin_number = Column(String)
 

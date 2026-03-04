@@ -80,60 +80,133 @@ class OllamaProcessor:
             logger.error(f"Ollama inference error: {e}")
             return "I'm having trouble thinking right now."
 
-    async def generate_grounded_response(
-        self, context: Dict[str, Any], question: str
-    ) -> str:
+    async def extract_intent_and_entities(self, user_query: str) -> Dict[str, Any]:
         """
-        Generate a response that is strictly grounded in the provided database context.
+        Extract intent and entities from user query via LLM.
+        Returns a dict with 'intent' and 'entities' keys.
+        """
+        EXTRACT_SYSTEM = (
+            "You are a data extraction engine. Your ONLY output is raw JSON. "
+            "Do NOT explain. Do NOT use markdown code blocks (```json). Do NOT converse. "
+            "Valid Intents: 'employee_lookup', 'department_lookup', 'cabin_lookup', 'general_conversation'. "
+            'Example Output: {"intent": "cabin_lookup", "entities": {"name": "Priya", "department": "HR"}}'
+        )
+        fallback = {"intent": "general_conversation", "entities": {}}
 
-        The model is explicitly instructed to ONLY use the given structured data
-        and to avoid guessing or hallucinating any information that is not present.
-        """
+        if not user_query or not user_query.strip():
+            return fallback
+
         try:
-            system_message = (
-                "You are AlmostHuman, the receptionist at Sharp Software Technology. "
-                "You will receive structured data from an office database and a visitor's question. "
-                "Your job is to respond in a short, professional receptionist style.\n\n"
-                "CRITICAL RULES:\n"
-                "- Only use the provided database information.\n"
-                "- If the answer is not clearly present in the data, say you don't know.\n"
-                "- Do NOT invent names, departments, cabin numbers, or any other facts.\n"
-                "- Do NOT reference being an AI or language model.\n"
-            )
-
-            context_pretty = json.dumps(context, indent=2, ensure_ascii=False)
-
-            user_message = (
-                f"Database result (structured JSON):\n{context_pretty}\n\n"
-                f"Visitor question:\n{question}\n\n"
-                "Using ONLY the information in the database result above, "
-                "generate a concise, professional receptionist-style answer."
-            )
-
             response = await self.client.chat(
                 model=self.model_name,
                 messages=[
-                    {"role": "system", "content": system_message},
-                    {"role": "user", "content": user_message},
+                    {"role": "system", "content": EXTRACT_SYSTEM},
+                    {"role": "user", "content": user_query.strip()},
                 ],
                 stream=False,
+                options={"temperature": 0},
+            )
+            if hasattr(response, "message"):
+                raw = response.message.content
+            else:
+                raw = response.get("message", {}).get("content", "")
+
+            raw = (raw or "").strip()
+            if not raw:
+                return fallback
+
+            if raw.startswith("```"):
+                for prefix in ("```json", "```"):
+                    if raw.startswith(prefix):
+                        raw = raw[len(prefix) :].strip()
+                        break
+                if raw.endswith("```"):
+                    raw = raw[:-3].strip()
+
+            parsed = json.loads(raw)
+            intent = parsed.get("intent", "general_conversation")
+            entities = (
+                parsed.get("entities")
+                if isinstance(parsed.get("entities"), dict)
+                else {}
             )
 
-            if hasattr(response, "message"):
-                content = response.message.content
-            else:
-                content = response.get("message", {}).get("content", "")
+            valid_intents = {
+                "employee_lookup",
+                "department_lookup",
+                "cabin_lookup",
+                "general_conversation",
+            }
+            if intent not in valid_intents:
+                intent = "general_conversation"
 
-            content = (content or "").strip()
+            return {"intent": intent, "entities": entities}
 
-            if not content:
-                logger.warning("Ollama returned empty grounded response.")
-                content = (
-                    "I'm sorry, I could not derive an answer from the office database."
-                )
+        except (json.JSONDecodeError, TypeError, Exception) as e:
+            logger.warning(f"Intent extraction failed, using fallback: {e}")
+            return fallback
 
-            return content
+    async def generate_grounded_response(self, context: dict, question: str) -> str:
+        """
+        Converts database results into a natural sentence.
+        """
+        # 1. Format the data into a clear string based on the result type
+        if "employee" in context:
+            # Handles: "Where is Priya?" or "Where is cabin 202?"
+            e = context["employee"]
+            info = f"Name: {e['name']}, Cabin: {e['cabin_number']}, Department: {e['department']}"
 
-        except Exception as e:
-            logger.error(f"Ollama grounded inference error: {e}")
-            return "I'm having trouble accessing the office database information right now."
+        elif "employees" in context:
+            # Handles: "Who is in HR?" or "Who is in Finance?"
+            dept = context.get("department", "the requested")
+            # Create a list of names and cabins
+            people = ", ".join(
+                [
+                    f"{emp['name']} (Cabin {emp['cabin_number']})"
+                    for emp in context["employees"]
+                ]
+            )
+            info = f"Department: {dept}, Staff: {people}"
+
+        else:
+            info = "No matching records found."
+
+        # 2. Create a direct instruction for this specific answer
+        # This does NOT change your global system prompt.
+        prompt = f""" u are a professional and polite office receptionist assisting visitors inside a company office.
+
+    A visitor asked:
+    "{question}"
+
+    The system searched internal records and returned the following information:
+    {info}
+
+    The information is provided in JSON format and may contain:
+    - employee details
+    - department information
+    - meeting information
+
+
+    Your task:
+    - Respond like a real office receptionist.
+    - Use the information in {info} to guide the visitor.
+    - If the information contains employee details, mention the employee's name, role, department, and cabin number.
+    - If multiple employees are present, list all of them clearly.
+    - If the information contains meeting details, guide the visitor to the correct meeting room or location.
+    - If {info} is empty, politely say that the information could not be found and ask the visitor to confirm the details.
+
+    IMPORTANT RULES:
+    - The information in {info} refers to the person, department, or meeting the visitor is asking about.
+    - Do NOT assume the visitor's identity.
+    - Do NOT invent names, cabin numbers, roles, or meeting details.
+    - Only use the information provided in {info}.
+    - Keep the response short, natural, and conversational (1–3 sentences).
+
+    Tone:
+    Friendly, helpful, and professional — like a real office receptionist.
+
+    Now generate the receptionist response."""
+
+        # 3. Get the response from Ollama
+        response = await self.get_response(prompt)
+        return response.strip()
