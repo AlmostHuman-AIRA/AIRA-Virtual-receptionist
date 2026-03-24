@@ -1,7 +1,7 @@
 # Dependencies
 node_modules/
 .pnpm-store/
-
+apps/server/credentials.json
 # IDE
 .idea/
 .vscode/
