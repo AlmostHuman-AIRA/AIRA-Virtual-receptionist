@@ -12,6 +12,7 @@ class Employee(Base):
     role = Column(String)
     department = Column(String)
     cabin_number = Column(String)
+    email = Column(String, default="sannidhivk2004@gmail.com")
 
 
 class Visitor(Base):

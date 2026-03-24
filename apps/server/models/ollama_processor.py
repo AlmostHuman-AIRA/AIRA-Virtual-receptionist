@@ -16,6 +16,7 @@ Confirm details, then guide them to HR, meeting room, or team.
 Never mention being an AI.
 Keep replies short and professional.
 NEVER make up a name, cabin number, or department.
+Do not guess the name , role, or department of an employee if not explicitly mentioned by the visitor. If the visitor does not provide this information, respond with a polite request for more details.
 """
 
 
@@ -32,7 +33,7 @@ class OllamaProcessor:
 
     def __init__(self):
         self.client = ollama.AsyncClient()
-        self.model_name = "llama3.2:1b"
+        self.model_name = "llama3.2:3b"
         self.history: List[Dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT}
         ]
@@ -51,6 +52,7 @@ class OllamaProcessor:
         # Keep only last 6 messages + system prompt to prevent memory bloat
         self.history = [self.history[0]] + self.history[-6:]
         self.history.append({"role": "user", "content": prompt})
+
         # Keep history short for Phi
         if len(self.history) > 7:
             self.history = [self.history[0]] + self.history[-6:]
@@ -75,36 +77,40 @@ class OllamaProcessor:
 
     async def extract_intent_and_entities(self, user_query: str) -> Dict[str, Any]:
         """Stateless extraction: Does NOT pollute conversation history."""
+
         EXTRACT_SYSTEM = """
-You are a robotic JSON extractor.
-RULES:
-Extract entities ONLY from the User Query.
-NEVER use names or roles from the examples below.
-If a name is not in the User Query, set the value to null.
-Ignore grammar errors; find the keywords.
-EXAMPLES:
-Query: 'where is [PERSON]' -> {"intent": "employee_lookup", "entities": {"employee_name": "[PERSON]"}}
-Query: 'who is [JOB_TITLE]' -> {"intent": "role_lookup", "entities": {"role": "[JOB_TITLE]"}}
-Query: 'I am [VISITOR]' -> {"intent": "general_conversation", "entities": {"visitor_name": "[VISITOR]"}}
-"""
+    You are a technical data extractor. Output ONLY valid JSON.
+    INTENTS: 
+    - "visitor_checkin": User introduces themselves (e.g., "I am Rinko").
+    - "employee_lookup": User asks for a person, role, or department.
+    - "schedule_meeting": User wants to book a time with someone.
+
+    ENTITIES:
+    - "visitor_name": Name of the person speaking.
+    - "visitor_status": "New Intern", "Guest", "Candidate".
+    - "employee_name": Name of the staff member mentioned.
+    - "role": Job title (e.g., "Marketing Manager").
+    - "time": Meeting time (e.g., "4:30 PM").
+    """
+        context_msgs = self.history[-3:] if len(self.history) > 1 else []
+
+        messages = [{"role": "system", "content": EXTRACT_SYSTEM}]
+        messages.extend(context_msgs)  # Add history to the extraction call
+        messages.append({"role": "user", "content": f"Extract from: '{user_query}'"})
 
         try:
-            # Direct call without adding to self.history
             response = await self.client.chat(
                 model=self.model_name,
-                messages=[
-                    {"role": "system", "content": EXTRACT_SYSTEM},
-                    {"role": "user", "content": user_query.strip()},
-                ],
-                stream=False,
+                format="json",
+                messages=messages,  # Now includes history!
                 options={"temperature": 0},
             )
             raw = response.message.content.strip()
-            print(f"Raw extraction output: {raw}")
 
-            # Clean JSON formatting if present
-            if raw.startswith("```"):
-                raw = raw.strip("`").replace("json", "").strip()
+            # Robust JSON cleaning: find the first '{' and last '}'
+            match = re.search(r"\{.*\}", raw, re.DOTALL)
+            if match:
+                raw = match.group(0)
 
             parsed = json.loads(raw)
             return {
@@ -116,7 +122,7 @@ Query: 'I am [VISITOR]' -> {"intent": "general_conversation", "entities": {"visi
                 ),
             }
         except Exception as e:
-            logger.warning(f"Extraction failed: {e}")
+            logger.warning(f"Extraction failed for query '{user_query}': {e}")
             return {"intent": "general_conversation", "entities": {}}
 
     async def generate_grounded_response(self, context: dict, question: str) -> str:

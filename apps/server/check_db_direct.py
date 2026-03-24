@@ -2,7 +2,9 @@ import sqlite3
 import os
 
 # IMPORTANT: Double check this path matches where your office.db is!
-db_path = "office.db"
+db_path = (
+    r"C:\Users\sanni\Desktop\working_almosthumanai-\apps\server\receptionist\office.db"
+)
 
 
 def test_connection():
@@ -21,7 +23,7 @@ def test_connection():
 
         # Try to find Rohit
         cursor.execute(
-            "SELECT name, role, cabin_number FROM employees WHERE name LIKE '%Rohit%'"
+            "SELECT name, role, cabin_number FROM employees WHERE name LIKE '%Vivek%'"
         )
         row = cursor.fetchone()
 
@@ -29,7 +31,7 @@ def test_connection():
             print(f"DATA FOUND -> Name: {row[0]}, Role: {row[1]}, Cabin: {row[2]}")
         else:
             print(
-                "RESULT: DB Connected, but 'Rohit' was not found in the 'employees' table."
+                "RESULT: DB Connected, but 'Priya' was not found in the 'employees' table."
             )
 
         conn.close()

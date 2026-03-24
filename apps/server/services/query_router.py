@@ -74,69 +74,68 @@ def _log_visitor_history(name: str, status: str):
         session.close()
 
 
+# Inside query_router.py
+
+
 def handle_db_query(
     llm_entities: Dict[str, Any], raw_query: str = None
 ) -> Optional[Dict[str, Any]]:
-    """Searches the Employee table with a manual keyword fallback."""
     session = SessionLocal()
     try:
-        name_val = llm_entities.get("name") or llm_entities.get("employee_name")
-        role_val = llm_entities.get("role")
-        dept_val = llm_entities.get("department")
-
-        print(
-            f"[DEBUG] Searching DB with: Name='{name_val}', Role='{role_val}', Dept='{dept_val}'"
+        # Combine all possible search terms
+        search_term = (
+            llm_entities.get("employee_name")
+            or llm_entities.get("role")
+            or llm_entities.get("name")
         )
 
-        # 1. Standard Search (AI Entities)
-        if name_val:
-            emp = (
-                session.query(Employee)
-                .filter(Employee.name.ilike(f"%{name_val}%"))
-                .first()
-            )
-            if emp:
-                return {
-                    "intent": "employee_lookup",
-                    "employee": _serialize_employee(emp),
-                }
+        # If AI failed, use the raw query keywords
+        if not search_term and raw_query:
+            # Simple logic: find the most likely noun in the query
+            words = raw_query.split()
+            search_term = words[-1].strip("?")  # Take the last word as a guess
 
-        if role_val:
-            employees = (
-                session.query(Employee)
-                .filter(Employee.role.ilike(f"%{role_val}%"))
-                .all()
-            )
-            if employees:
-                return {
-                    "intent": "role_lookup",
-                    "role": role_val,
-                    "employees": [_serialize_employee(e) for e in employees],
-                }
+        if not search_term:
+            return None
 
-        # 2. SMART FALLBACK (Keyword search in raw query)
-        if raw_query:
-            print(
-                f"[DEBUG] AI failed to extract entities. Scanning raw query: '{raw_query}'"
+        print(f"[DEBUG] Searching DB for term: '{search_term}'")
+
+        # BROAD SEARCH: Check Name, Role, AND Department
+        emp = (
+            session.query(Employee)
+            .filter(
+                (Employee.name.ilike(f"%{search_term}%"))
+                | (Employee.role.ilike(f"%{search_term}%"))
+                | (Employee.department.ilike(f"%{search_term}%"))
+                |
+                # Special case for "HR" -> "Human Resources"
+                (
+                    Employee.department.ilike("%HR%")
+                    if "human" in search_term.lower()
+                    else False
+                )
             )
-            clean_query = raw_query.lower()
-            all_employees = session.query(Employee).all()
-            for emp in all_employees:
-                # Check if role is mentioned in the sentence
-                if emp.role and emp.role.lower() in clean_query:
-                    print(f"[DEBUG] Found Role Match via Keyword: {emp.role}")
-                    return {
-                        "intent": "role_lookup",
-                        "role": emp.role,
-                        "employees": [_serialize_employee(emp)],
-                    }
-                # Check if name is mentioned
-                if emp.name.lower() in clean_query:
-                    print(f"[DEBUG] Found Name Match via Keyword: {emp.name}")
-                    return {
-                        "intent": "employee_lookup",
-                        "employee": _serialize_employee(emp),
-                    }
+            .first()
+        )
+
+        if emp:
+            return {
+                "intent": "employee_lookup",
+                "employee": _serialize_employee(emp),
+            }
+
+        # If no single employee, check if it's a department list
+        dept_emps = (
+            session.query(Employee)
+            .filter(Employee.department.ilike(f"%{search_term}%"))
+            .all()
+        )
+        if dept_emps:
+            return {
+                "intent": "role_lookup",
+                "department": search_term,
+                "employees": [_serialize_employee(e) for e in dept_emps],
+            }
 
         return None
     finally:
@@ -164,6 +163,15 @@ def handle_schedule_meeting() -> Optional[Dict[str, Any]]:
         )
         session.add(new_meeting)
         session.commit()
+
+        # Generate Google Calendar Invite!
+        if getattr(emp, "email", None):
+            try:
+                from services.calendar_service import send_calendar_invite
+
+                send_calendar_invite(v_name, emp.email, dt)
+            except Exception as e:
+                logger.error(f"Calendar invite failed: {e}")
 
         meeting_state.update(
             {"visitor_name": None, "employee_name": None, "time": None}
