@@ -2,21 +2,38 @@ import json
 import logging
 import re
 from typing import List, Dict, Any
-
 import ollama
 
 logger = logging.getLogger(__name__)
 
-# Cleaned up: Removed the confusing empty JSON Data block
+# 1. CONVERSATIONAL PROMPT (For general chat)
 SYSTEM_PROMPT = """
 You are AlmostHuman, the receptionist at Sharp Software Technology.
 Greet visitors politely.
 Identify if they are employee, intern, guest, or candidate.
-Confirm details, then guide them to HR, meeting room, or team.
-Never mention being an AI.
-Keep replies short and professional.
-NEVER make up a name, cabin number, or department.
-Do not guess the name , role, or department of an employee if not explicitly mentioned by the visitor. If the visitor does not provide this information, respond with a polite request for more details.
+
+### CONSTRAINTS & GUARDRAILS:
+1. NEVER ask for or mention internal database IDs or ID numbers.
+2. NEVER ask for department names or employee codes.
+3. NEVER make up meeting availability or check calendars.
+4. If a user wants a meeting, ONLY collect: Name, Person to see, and Time.
+5. If the 'Context' provided to you already contains a name, do not ask for it again.
+6. Keep replies very short (1-2 sentences).
+7. Never mention being an AI.
+"""
+
+# 2. EXTRACTION PROMPT (For structured data)
+EXTRACT_SYSTEM = """
+Extract entities from the user's input. Return ONLY a JSON object.
+Rules:
+1. 'visitor_name': The person speaking.
+2. 'employee_name': The person they want to meet.
+3. 'role': Job title mentioned (e.g. HR, Manager).
+4. 'time': Specific time (ignore 'today', 'now', 'soon').
+5. 'intent': 'check_in', 'schedule_meeting', or 'employee_lookup'.
+
+Example: "I am Jim, I want to see Priya at 4pm"
+Output: {"intent": "schedule_meeting", "entities": {"visitor_name": "Jim", "employee_name": "Priya", "time": "4:00 PM"}}
 """
 
 
@@ -40,7 +57,7 @@ class OllamaProcessor:
         logger.info(f"OllamaProcessor initialized with model '{self.model_name}'")
 
     def reset_history(self):
-        """Clear the conversation history (preserving system prompt)."""
+        """Clear the conversation history."""
         self.history = [{"role": "system", "content": SYSTEM_PROMPT}]
         logger.info("OllamaProcessor conversation history reset")
 
@@ -49,13 +66,9 @@ class OllamaProcessor:
         if not prompt:
             return ""
 
-        # Keep only last 6 messages + system prompt to prevent memory bloat
+        # Keep history manageable
         self.history = [self.history[0]] + self.history[-6:]
         self.history.append({"role": "user", "content": prompt})
-
-        # Keep history short for Phi
-        if len(self.history) > 7:
-            self.history = [self.history[0]] + self.history[-6:]
 
         try:
             response = await self.client.chat(
@@ -64,95 +77,73 @@ class OllamaProcessor:
                 stream=False,
             )
             content = response.message.content.strip()
-
-            if not content:
-                content = "Welcome to Sharp Software Technology! How can I help you?"
-
             self.history.append({"role": "assistant", "content": content})
             return content
-
         except Exception as e:
             logger.error(f"Ollama inference error: {e}")
-            return "I'm having trouble connecting to the system right now."
+            return "Welcome to Sharp Software Technology. How can I help you?"
 
     async def extract_intent_and_entities(self, user_query: str) -> Dict[str, Any]:
-        """Stateless extraction: Does NOT pollute conversation history."""
-
-        EXTRACT_SYSTEM = """
-    You are a technical data extractor. Output ONLY valid JSON.
-    INTENTS: 
-    - "visitor_checkin": User introduces themselves (e.g., "I am Rinko").
-    - "employee_lookup": User asks for a person, role, or department.
-    - "schedule_meeting": User wants to book a time with someone.
-
-    ENTITIES:
-    - "visitor_name": Name of the person speaking.
-    - "visitor_status": "New Intern", "Guest", "Candidate".
-    - "employee_name": Name of the staff member mentioned.
-    - "role": Job title (e.g., "Marketing Manager").
-    - "time": Meeting time (e.g., "4:30 PM").
-    """
-        context_msgs = self.history[-3:] if len(self.history) > 1 else []
-
-        messages = [{"role": "system", "content": EXTRACT_SYSTEM}]
-        messages.extend(context_msgs)  # Add history to the extraction call
-        messages.append({"role": "user", "content": f"Extract from: '{user_query}'"})
-
+        """Stateless extraction: Uses EXTRACT_SYSTEM to get JSON data."""
         try:
             response = await self.client.chat(
                 model=self.model_name,
-                format="json",
-                messages=messages,  # Now includes history!
-                options={"temperature": 0},
+                messages=[
+                    {"role": "system", "content": EXTRACT_SYSTEM},
+                    {"role": "user", "content": user_query.strip()},
+                ],
+                stream=False,
+                options={"temperature": 0},  # Keep it deterministic
             )
             raw = response.message.content.strip()
 
-            # Robust JSON cleaning: find the first '{' and last '}'
-            match = re.search(r"\{.*\}", raw, re.DOTALL)
-            if match:
-                raw = match.group(0)
+            # Clean JSON: Remove markdown code blocks if present
+            if "```" in raw:
+                raw = re.sub(r"```(?:json)?", "", raw).strip()
+
+            # Find the first '{' and last '}' to handle extra text
+            start = raw.find("{")
+            end = raw.rfind("}") + 1
+            if start != -1 and end != 0:
+                raw = raw[start:end]
 
             parsed = json.loads(raw)
+
+            # Handle cases where LLM returns flat JSON or nested entities
+            entities = parsed.get("entities", parsed)
+            if not isinstance(entities, dict):
+                entities = parsed
+
             return {
                 "intent": parsed.get("intent", "general_conversation"),
-                "entities": (
-                    parsed.get("entities", {})
-                    if isinstance(parsed.get("entities"), dict)
-                    else {}
-                ),
+                "entities": entities,
             }
         except Exception as e:
-            logger.warning(f"Extraction failed for query '{user_query}': {e}")
+            logger.error(
+                f"Extraction failed: {e} | Raw output was: {raw if 'raw' in locals() else 'None'}"
+            )
             return {"intent": "general_conversation", "entities": {}}
 
     async def generate_grounded_response(self, context: dict, question: str) -> str:
-        """Stateless grounded response: Does NOT pollute conversation history."""
+        """Stateless grounded response for database lookups."""
         if "employee" in context:
             e = context["employee"]
             info = f"Name: {e['name']}, Role: {e['role']}, Cabin: {e['cabin_number']}, Department: {e['department']}"
-        elif "employees" in context:
-            dept = context.get("department", "the requested")
-            people = ", ".join(
-                [f"{emp['name']} ({emp['role']})" for emp in context["employees"]]
-            )
-            info = f"Department: {dept}, Staff: {people}"
         else:
             info = "No records found."
 
-        # Your exact prompt text preserved
-        prompt_text = f"""u are a professional and polite office receptionist assisting visitors inside a company office.
-    A visitor asked: "{question}"
-    The system searched internal records and returned: {info}
+        # UPDATED PROMPT TO BE NEUTRAL (Changed 'A visitor' to 'The person')
+        prompt_text = f"""You are a professional office receptionist.
+    The person asked: "{question}"
+    Internal records show: {info}
     
-    Your task:
-    - Respond like a real office receptionist.
-    - Use the information in {info} to guide the visitor.
-    - Keep the response short, natural, and conversational (1–3 sentences).
-    - Tone: Friendly, helpful, and professional.
-    Now generate the receptionist response."""
+    Task:
+    - Use the info to guide them.
+    - Keep it to 1-2 sentences.
+    - Tone: Friendly and professional.
+    """
 
         try:
-            # Direct call to avoid history poisoning
             response = await self.client.chat(
                 model=self.model_name,
                 messages=[{"role": "system", "content": prompt_text}],
@@ -161,4 +152,4 @@ class OllamaProcessor:
             return response.message.content.strip()
         except Exception as e:
             logger.error(f"Grounded response error: {e}")
-            return "I found the information, but I'm having trouble explaining it. Please wait a moment."
+            return "I found the information. Please follow the directions to the cabin."

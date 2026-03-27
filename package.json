@@ -1,5 +1,5 @@
 {
-	"name": "talkmateai",
+	"name": "AlmostHumanAI",
 	"version": "1.0.0",
 	"description": "",
 	"scripts": {
@@ -16,7 +16,7 @@
 		"format:check:client": "pnpm --filter @talkmateai/client format:check",
 		"format:check:server": "pnpm --filter @talkmateai/server format:check"
 	},
-	"author": "kiranbaby14",
+	"author": "Sannidhivk",
 	"devDependencies": {
 		"concurrently": "^9.2.0",
 		"husky": "^9.1.7"
