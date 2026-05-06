@@ -3,7 +3,7 @@ import re
 import uuid
 import asyncio
 from datetime import datetime, timedelta
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional, List, Set
 from sqlalchemy import or_, and_
 
 # Database and Model Imports
@@ -22,7 +22,7 @@ from services.calendar_service import schedule_google_meeting_background
 # Logger Configuration
 logger = logging.getLogger(__name__)
 
-# Constants
+# Constants - STRICTLY PRESERVED
 AI_NAME = "Jarvis"
 COMPANY_NAME = "Sharp Software Development India Private Limited."
 SESSION_TIMEOUT_SECONDS = 300
@@ -42,7 +42,21 @@ NAME_BLACKLIST = {
     "null",
     "it",
     "alexa",
+    "dadfish",
+    "jadfish",
 }
+
+WAKE_WORDS = [
+    "hey jarvis",
+    "hi jarvis",
+    "wake_word_triggered",
+    "hey charles",
+    "hey elvis",
+    "hey jadfish",
+    "hey dadfish",
+    "hey travis",
+]
+
 PRONOUNS = {
     "him",
     "her",
@@ -56,15 +70,8 @@ PRONOUNS = {
     "this guy",
     "this person",
 }
-FOOD_DELIVERY_KEYWORDS = {
-    "zomato",
-    "swiggy",
-    "food",
-    "bistro",
-    "blinkit",
-    "danzo",
-}
 
+FOOD_DELIVERY_KEYWORDS = {"zomato", "swiggy", "food", "bistro", "blinkit", "danzo"}
 PACKAGE_DELIVERY_KEYWORDS = {
     "amazon",
     "flipkart",
@@ -76,17 +83,37 @@ PACKAGE_DELIVERY_KEYWORDS = {
     "toing",
 }
 
+# Semantic Role-Group Mapping
+SEMANTIC_MAP = {
+    "fix": "Operations",
+    "leak": "Operations",
+    "broken": "Operations",
+    "maintenance": "Operations",
+    "ac": "Operations",
+    "repair": "Operations",
+    "hiring": "HR",
+    "recruit": "HR",
+    "interview": "HR",
+    "money": "Finance",
+    "account": "Finance",
+    "invoice": "Finance",
+    "bill": "Finance",
+    "payment": "Finance",
+    "tech": "IT Support",
+    "computer": "IT Support",
+    "system": "IT Support",
+    "internet": "IT Support",
+    "software": "IT Support",
+}
+
 
 class State:
-    """Conversation States for logic tracking."""
-
     INIT = "INIT"
     COLLECTING = "COLLECTING"
     COMPLETED = "COMPLETED"
     TERMINATED = "TERMINATED"
 
 
-# Global In-Memory Session Storage
 _client_sessions: Dict[str, Dict[str, Any]] = {}
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -103,23 +130,18 @@ def get_session_state(client_id: str) -> Dict[str, Any]:
             and (now - last_active).total_seconds() > SESSION_TIMEOUT_SECONDS
         ):
             clear_session_state(client_id)
-
     if client_id not in _client_sessions:
         _client_sessions[client_id] = _fresh_state()
-
     _client_sessions[client_id]["last_active"] = now
     return _client_sessions[client_id]
 
 
 def clear_session_state(client_id: str) -> None:
-    """Physical deletion of session data and external cache resets."""
     if client_id in _client_sessions:
         session_id = _client_sessions[client_id].get("session_id")
         if session_id:
             clear_slack_cache(session_id)
         del _client_sessions[client_id]
-
-    _client_sessions[client_id] = _fresh_state()
     try:
         GroqProcessor.get_instance().reset_history(client_id)
     except Exception as e:
@@ -133,6 +155,7 @@ def _fresh_state() -> Dict[str, Any]:
         "last_active": datetime.utcnow(),
         "visitor_name": None,
         "visitor_email": None,
+        "visitor_email": None,
         "visitor_type": "Visitor/Guest",
         "greeting_sent": False,  # FIX: Prevent repeating "Good Morning"
         "meeting_with_raw": None,
@@ -140,25 +163,33 @@ def _fresh_state() -> Dict[str, Any]:
         "host_details": None,  # Store role for Slack
         "is_employee": False,
         "purpose": None,
-        "is_delivery": False,
         "scheduling_active": False,
-        "sched_employee_raw": None,
         "sched_employee_name": None,
+        "sched_employee_email": None,
         "sched_employee_email": None,
         "sched_date": None,
         "sched_time": None,
         "sched_purpose": None,
-        "sched_pending_confirm": False,
-        "attendees_finalized": False,
         "identity_updated": False,
-        "host_ask_count": 0,
-        "thank_you_count": 0,
+        "notified_hosts": set(),
+        "greeted": False,
+        "force_admin": False,
     }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # NORMALIZATION & LOOKUP HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+def _get_time_greeting() -> str:
+    hour = datetime.now().hour
+    if 5 <= hour < 12:
+        return "Good Morning"
+    elif 12 <= hour < 17:
+        return "Good Afternoon"
+    else:
+        return "Good Evening"
 
 
 def _is_jarvis(name: str) -> bool:
@@ -169,37 +200,45 @@ def _is_jarvis(name: str) -> bool:
 
 def _determine_visitor_type(text: str, purpose: str, current_type: str) -> str:
     combined = f"{text} {purpose}".lower()
-
+    if "intern" in combined:
+        return "Intern"
     if re.search(r"\b(interview|candidate)\b", combined):
         return "Interviewee"
-
-    # --- Checks the Food list ---
     if any(k in combined for k in FOOD_DELIVERY_KEYWORDS):
         return "Food Delivery"
-
-    # --- Checks the Package list ---
     if any(k in combined for k in PACKAGE_DELIVERY_KEYWORDS):
         return "Package Delivery"
-
-    # --- Expanded Maintenance list ---
     if re.search(
         r"\b(vendor|electrician|plumber|maintenance|ac|fix|leak|broken)\b", combined
     ):
         return "Contractor/Vendor"
-
     if re.search(r"\b(client|customer|demo)\b", combined):
         return "Client"
-
     return current_type or "Visitor/Guest"
+
+
+def _format_descriptive_purpose(
+    state: Dict[str, Any], event_type: str = "VISIT"
+) -> str:
+    v_type = state.get("visitor_type", "Visitor")
+    host = (
+        state.get("meeting_with_resolved")
+        or state.get("sched_employee_name")
+        or "Administration Team"
+    )
+    base_purpose = (
+        state.get("purpose") or state.get("sched_purpose") or "General Business"
+    )
+    if event_type == "SCHEDULED":
+        return f"SCHEDULED: {base_purpose} with {host} (Set for {state.get('sched_date')} @ {state.get('sched_time')})"
+    return f"{v_type.upper()}: {base_purpose} for {host}"
 
 
 def _normalize_date(raw: str) -> Optional[str]:
     if not raw:
         return None
-    s = str(raw).strip().lower()
+    s = str(raw).lower()
     today = datetime.now().date()
-
-    # FIX: Handle "Next Friday", "Next Monday", etc.
     match = re.search(
         r"next\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)", s
     )
@@ -214,15 +253,13 @@ def _normalize_date(raw: str) -> Optional[str]:
             "sun": 6,
         }
         target_day = weekday_map[match.group(1)[:3]]
-        current_day = today.weekday()
-        days_ahead = (target_day - current_day + 7) % 7
+        days_ahead = (target_day - today.weekday() + 7) % 7
         if days_ahead == 0:
             days_ahead = 7
         return (today + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
-
-    if s in ("today", "now"):
+    if "today" in s:
         return today.strftime("%Y-%m-%d")
-    if s == "tomorrow":
+    if "tomorrow" in s:
         return (today + timedelta(days=1)).strftime("%Y-%m-%d")
     try:
         return datetime.strptime(s, "%Y-%m-%d").date().strftime("%Y-%m-%d")
@@ -235,150 +272,113 @@ def _normalize_time(raw: str) -> Optional[str]:
         return None
     s = (
         str(raw)
-        .strip()
         .lower()
         .replace("p.m.", "pm")
         .replace("a.m.", "am")
+        .replace(".", "")
         .replace(" ", "")
     )
     m = re.match(r"^(\d{1,2})(?::(\d{2}))?(am|pm)$", s)
     if m:
-        hour, minute, mer = int(m.group(1)), int(m.group(2) or 0), m.group(3)
-        if mer == "pm" and hour != 12:
-            hour += 12
-        if mer == "am" and hour == 12:
-            hour = 0
-        return f"{hour:02d}:{minute:02d}"
+        h, mn, mer = int(m.group(1)), int(m.group(2) or 0), m.group(3)
+        if mer == "pm" and h != 12:
+            h += 12
+        if mer == "am" and h == 12:
+            h = 0
+        return f"{h:02d}:{mn:02d}"
     return s if re.match(r"^\d{2}:\d{2}$", s) else None
 
 
-def _lookup_employee(search_term: str) -> Optional[Any]:
-    if not search_term:
+def _lookup_employee(search_term: str) -> Optional[Employee]:
+    if not search_term or len(str(search_term)) < 2:
         return None
-    clean = search_term.strip().lower()
+    clean = re.sub(
+        r"\b(the|is|who|of|this|company|with|for|at|his|her|name|cabin|room|manager|engineer|lead|ceo)\b",
+        "",
+        str(search_term).lower(),
+    ).strip()
+    for key, dept in SEMANTIC_MAP.items():
+        if key in clean:
+            clean = dept
+            break
+    if clean in ["admin", "administration", "front desk", "anyone"]:
+        return Employee(
+            name="Administration Team", role="Support", location="Reception"
+        )
     db = SessionLocal()
     try:
-        # Step 1: Exact Name/Role/Dept Match (File A Logic)
         emp = (
             db.query(Employee)
             .filter(
                 or_(
-                    Employee.name.ilike(f"%{clean}%"),
                     Employee.role.ilike(f"%{clean}%"),
+                    Employee.name.ilike(f"%{clean}%"),
                     Employee.department.ilike(f"%{clean}%"),
                 )
             )
             .first()
         )
-
-        # Step 2: Fallbacks (File A)
-        if not emp:
-            if "hr" in clean:
-                emp = db.query(Employee).filter(Employee.department.ilike("hr")).first()
-            elif "sales" in clean:
-                emp = (
-                    db.query(Employee)
-                    .filter(Employee.department.ilike("sales"))
-                    .first()
-                )
-            elif "admin" in clean:
-                emp = (
-                    db.query(Employee)
-                    .filter(Employee.department.ilike("admin"))
-                    .first()
-                )
         return emp
     finally:
         db.close()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ENTITY MERGING (ROLE AWARE & CONTEXT LOCKING)
+# PERSISTENCE
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _merge_checkin_entities(
-    state: Dict[str, Any], entities: Dict[str, Any], user_query: str, intent: str
-) -> None:
-    query_low = user_query.lower()
-
-    # 1. IDENTITY & SWITCH DETECTION (File A)
-    v_name = entities.get("visitor_name")
-    if v_name and v_name.lower() not in NAME_BLACKLIST:
-        new_name = v_name.capitalize()
-
-        # FIX: Check if this "visitor" is actually an employee in our DB
-        emp_record = get_employee_by_name(new_name)
-        if emp_record or "i am an employee" in query_low:
-            state["is_employee"] = True
-            state["visitor_type"] = "Employee"
-
-        if state.get("visitor_name") and state["visitor_name"] != new_name:
-            state["visitor_name"] = new_name
-            state["identity_updated"] = True
-            state["conv_state"] = State.INIT
-        elif not state.get("visitor_name"):
-            state["visitor_name"] = new_name
-
-    # 2. EMAIL CAPTURE (File B)
-    if entities.get("visitor_email"):
-        state["visitor_email"] = entities["visitor_email"]
-
-    # 3. SCHEDULING DATA LOCKING
-    if entities.get("employee_name"):
-        state["sched_employee_raw"] = entities["employee_name"]
-        emp = _lookup_employee(entities["employee_name"])
-        if emp:
-            state["sched_employee_name"] = emp.name
-            state["sched_employee_email"] = emp.email
-            state["meeting_with_resolved"] = emp.name
-            state["host_details"] = f"{emp.role} in {emp.department}"
-
-    if entities.get("date"):
-        state["sched_date"] = _normalize_date(str(entities["date"]))
-    if entities.get("time"):
-        state["sched_time"] = _normalize_time(str(entities["time"]))
-    if entities.get("purpose"):
-        state["sched_purpose"] = entities["purpose"]
-        state["purpose"] = entities["purpose"]
-
-    # 5. VISITOR TYPE MAPPING (File A)
-    if "interview" in query_low:
-        state["visitor_type"] = "Interviewee"
-    elif any(k in query_low for k in FOOD_DELIVERY_KEYWORDS):
-        state["visitor_type"] = "Food Delivery"
-        state["purpose"] = "Dropping off food"
-    elif any(k in query_low for k in PACKAGE_DELIVERY_KEYWORDS):
-        state["visitor_type"] = "Package Delivery"
-        state["purpose"] = "Dropping off a package"
-    elif any(
-        k in query_low
-        for k in [
-            "contractor",
-            "maintenance",
-            "ac",
-            "fix",
-            "leak",
-            "plumber",
-            "electrician",
-            "broken",
-        ]
-    ):
-        state["visitor_type"] = "Contractor/Vendor"
-        # Only auto-assign Admin if no specific host was mentioned yet
-        if not state.get("meeting_with_resolved"):
-            state["meeting_with_resolved"] = "Administration Team"
-    elif "demo" in query_low or "client" in query_low:
-        state["visitor_type"] = "Client"  # Lock it in raw too
+def _finalize_meeting_and_log(state: Dict[str, Any]) -> bool:
+    db = SessionLocal()
+    try:
+        v_name = state.get("visitor_name") or "Guest"
+        host_name = state["sched_employee_name"]
+        emp = _lookup_employee(host_name)
+        narrative = _format_descriptive_purpose(state, "SCHEDULED")
+        mid = schedule_meeting(
+            v_name,
+            "Visitor",
+            host_name,
+            state["sched_date"],
+            state["sched_time"],
+            narrative,
+        )
+        if not mid:
+            return False
+        visitor = db.query(Visitor).filter(Visitor.name.ilike(v_name)).first()
+        if not visitor:
+            visitor = Visitor(name=v_name)
+            db.add(visitor)
+            db.flush()
+        log = ReceptionLog(
+            visitor_id=visitor.id,
+            employee_id=emp.id if emp and emp.id else None,
+            person_type=state["visitor_type"],
+            purpose=narrative,
+            check_in_time=datetime.utcnow(),
+        )
+        db.add(log)
+        db.commit()
+        send_slack_arrival(
+            host_name, v_name, state["visitor_type"], narrative, state["session_id"]
+        )
+        state["notified_hosts"].add(host_name)
+        if state.get("sched_employee_email"):
+            schedule_google_meeting_background(
+                v_name,
+                state["sched_employee_email"],
+                state["sched_date"],
+                state["sched_time"],
+            )
+        return True
+    except Exception as e:
+        logger.error(f"Finalization failed: {e}")
+        return False
+    finally:
+        db.close()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# COMMIT & NOTIFICATION LOGIC
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-# 3. IMPROVED DATABASE LOGGING (Detailed Notes)
-def _commit_checkin(state: Dict[str, Any], client_id: str, user_query: str) -> bool:
+def _commit_checkin(state: Dict[str, Any]) -> bool:
     db = SessionLocal()
     try:
         v_name = state.get("visitor_name") or "Guest"
@@ -387,374 +387,236 @@ def _commit_checkin(state: Dict[str, Any], client_id: str, user_query: str) -> b
             visitor = Visitor(name=v_name)
             db.add(visitor)
             db.flush()
-
         host_raw = state.get("meeting_with_resolved") or state.get("meeting_with_raw")
         host_emp = _lookup_employee(host_raw)
-
-        v_type = state.get("visitor_type", "Visitor/Guest")
-        purpose = state.get("purpose") or "General Visit"
-
-        # Note should reflect the real Host
-        target_name = host_emp.name if host_emp else host_raw or "Admin Team"
-
         log = ReceptionLog(
             visitor_id=visitor.id,
-            employee_id=host_emp.id if host_emp else None,
-            person_type=v_type,
-            purpose=purpose,
-            notes=f"[{v_type}] for {target_name} via Jarvis. Reason: {purpose}",
+            employee_id=host_emp.id if host_emp and host_emp.id else None,
+            person_type=state["visitor_type"],
+            purpose=_format_descriptive_purpose(state),
             check_in_time=datetime.utcnow(),
         )
         db.add(log)
         db.commit()
-
-        # SLACK
-        send_slack_arrival(target_name, v_name, v_type, purpose, state["session_id"])
         return True
     except Exception as e:
-        logger.error(f"Commit Failed: {e}")
+        logger.error(f"Commit error: {e}")
         return False
     finally:
         db.close()
 
 
-# FIX: Database Commit for the 'meetings' table
-def _commit_meeting_to_db(state: Dict[str, Any]) -> bool:
-    try:
-        res = schedule_meeting(
-            state.get("visitor_name") or "Guest",
-            "visitor",
-            state.get("sched_employee_name"),
-            state.get("sched_date"),
-            state.get("sched_time"),
-            state.get("sched_purpose") or "Meeting",
-        )
-        if not res:
-            return False
-
-        # Slack
-        send_slack_arrival(
-            state["sched_employee_name"],
-            state["visitor_name"],
-            "Scheduled Meeting",
-            state["sched_purpose"],
-            state["session_id"],
-        )
-
-        # Google Calendar (Background)
-        if state.get("sched_employee_email"):
-            schedule_google_meeting_background(
-                visitor_name=state.get("visitor_name") or "Guest",
-                employee_email=state["sched_employee_email"],
-                date_str=state["sched_date"],
-                time_str=state["sched_time"],
-            )
-        return True
-    except Exception as e:
-        logger.error(f"Meeting Commit Failed: {e}")
-        return False
-
-
 # ─────────────────────────────────────────────────────────────────────────────
-# ENTITY MERGING (UPGRADED: Persona Switch & Regex Fallback)
+# HANDLERS
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _clean_entity(val: Any) -> Optional[str]:
-    s = str(val).strip() if val else ""
-    return (
-        s
-        if s and s.lower() not in ("null", "none", "") and s.lower() not in PRONOUNS
-        else None
+def _merge_checkin_entities(
+    state: Dict[str, Any], entities: Dict[str, Any], user_query: str
+) -> None:
+    query_low = user_query.lower()
+    v_name = entities.get("visitor_name")
+    if v_name and not _is_jarvis(v_name):
+        new_name = v_name.capitalize()
+        emp_record = get_employee_by_name(new_name)
+        if emp_record or "i am an employee" in query_low:
+            state["is_employee"], state["visitor_type"] = True, "Employee"
+        if state.get("visitor_name") and state["visitor_name"] != new_name:
+            state["visitor_name"], state["identity_updated"] = new_name, True
+        elif not state.get("visitor_name"):
+            state["visitor_name"] = new_name
+
+    state["visitor_type"] = _determine_visitor_type(
+        user_query, entities.get("purpose", ""), state["visitor_type"]
     )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CORE AI ROUTING & LLM
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-async def _llm_reply(
-    situation: str, state: Dict[str, Any], user_query: str = None, client_id: str = None
-) -> str:
-    llm = GroqProcessor.get_instance()
-
-    # Strictly define the roles for the LLM
-    visitor = state.get("visitor_name") or "Unknown Visitor"
-    host = (
-        state.get("meeting_with_resolved")
-        or state.get("sched_employee_name")
-        or "Administration Team"
+    target = (
+        entities.get("employee_name")
+        or entities.get("employee_role")
+        or state.get("meeting_with_raw")
     )
+    if target and not _is_jarvis(target):
+        state["meeting_with_raw"] = target
+        emp = _lookup_employee(target)
+        if emp:
+            state["meeting_with_resolved"] = state["sched_employee_name"] = emp.name
+            state["sched_employee_email"] = emp.email
+        else:
+            state["meeting_with_resolved"] = target
 
-    info_block = f"""
-    - TALKING TO: {visitor}
-    - WANT TO SEE: {host}
-    - STATUS: {'Meeting Scheduled' if state['conv_state'] == State.COMPLETED else 'Collecting Info'}
-    - DATE: {state.get('sched_date') or 'None'}
-    - TIME: {state.get('sched_time') or 'None'}
-    """
-    # FIX: Logic to check if we already greeted them
-    is_first_turn = not state.get("greeting_sent", False)
-
-    prompt = f"""
-    {BASE_SYSTEM_PROMPT}
-    KNOWLEDGE BASE:
-    {info_block}
-
-    STRICT RULES:
-    1. GREETING: {"Give a warm greeting (Good Morning/Afternoon)" if is_first_turn else "DO NOT use a time-based greeting like Good Morning. Simply respond."}
-    2. TARGET: Speak to {visitor}.
-    3. GOAL: {situation}
-    4. USER SAID: "{user_query}"
-    """
-    reply = await llm.get_raw_response(prompt, client_id=client_id)
-    state["greeting_sent"] = True  # Mark that we have greeted
-    return reply
+    if entities.get("date"):
+        state["sched_date"] = _normalize_date(str(entities["date"]))
+    if entities.get("time"):
+        state["sched_time"] = _normalize_time(str(entities["time"]))
+    if entities.get("purpose"):
+        state["purpose"] = state["sched_purpose"] = entities["purpose"]
 
 
 async def _handle_availability_check(
-    state: Dict[str, Any], user_query: str, client_id: str
+    state: Dict[str, Any], query: str, client_id: str
 ) -> str:
-    """Direct database query to check for free slots."""
-    host_raw = state.get("meeting_with_raw")
-    if not host_raw:
+    target = state.get("meeting_with_resolved") or query
+    emp = _lookup_employee(target)
+    if emp:
+        slots = get_available_slots(emp.name, datetime.now().strftime("%Y-%m-%d"))
+        slot_str = ", ".join(slots[:3]) if slots else "no more slots today"
         return await _llm_reply(
-            "Ask who they want to check availability for.", state, user_query, client_id
-        )
-
-    today = datetime.now().strftime("%Y-%m-%d")
-    # Real DB Query
-    slots = get_available_slots(host_raw, today)
-
-    if not slots:
-        return await _llm_reply(
-            f"Tell them {host_raw} has no slots available for today.",
+            f"Inform them {emp.name} is the {emp.role}. Free slots: {slot_str}.",
             state,
-            user_query,
+            query,
             client_id,
         )
-
-    # Take first 3 slots for brevity
-    slot_str = ", ".join(slots[:3])
     return await _llm_reply(
-        f"Inform them {host_raw} is free at: {slot_str}. Ask if they want to book one.",
-        state,
-        user_query,
-        client_id,
-    )
-
-
-async def _handle_scheduling(
-    client_id: str,
-    user_query: str,
-    state: Dict[str, Any],
-    entities: Dict[str, Any],
-    intent: str,
-) -> str:
-
-    # Sync meeting_with_raw to sched_employee_raw as a fallback
-    if not state.get("sched_employee_raw") and state.get("meeting_with_raw"):
-        state["sched_employee_raw"] = state["meeting_with_raw"]
-
-    # 1. SMART TIME VALIDATION
-    if state["sched_date"] and state["sched_time"]:
-        now = datetime.now()
-        try:
-            sched_dt = datetime.strptime(
-                f"{state['sched_date']} {state['sched_time']}", "%Y-%m-%d %H:%M"
-            )
-            if sched_dt < now:
-                state["sched_time"] = None
-                return await _llm_reply(
-                    "Explain that the time is in the past.",
-                    state,
-                    user_query,
-                    client_id,
-                )
-        except:
-            pass
-
-    # 2. SHORT-CIRCUIT: Check for missing data in logical order
-    if not state.get("visitor_name") and not state.get("is_employee"):
-        return await _llm_reply(
-            "Ask for their name politely.", state, user_query, client_id
-        )
-
-    if not state.get("sched_employee_raw"):
-        return await _llm_reply(
-            "Ask who they want to schedule the meeting with.",
-            state,
-            user_query,
-            client_id,
-        )
-
-    if not state.get("sched_employee_name"):
-        emp = _lookup_employee(state["sched_employee_raw"])
-        if emp:
-            state["sched_employee_name"] = emp.name
-            state["sched_employee_email"] = emp.email
-        else:
-            state["sched_employee_name"] = state["sched_employee_raw"]
-
-    if not state.get("sched_date"):
-        return await _llm_reply(
-            "Ask for the date of the meeting.", state, user_query, client_id
-        )
-    if not state.get("sched_time"):
-        return await _llm_reply(
-            "Ask for the time of the meeting.", state, user_query, client_id
-        )
-    if not state.get("sched_purpose"):
-        return await _llm_reply(
-            "Ask for the purpose of the meeting.", state, user_query, client_id
-        )
-
-    # 3. ACTION & CONFIRMATION
-    if intent == "confirm" or any(
-        w in user_query.lower() for w in ["yes", "yeah", "correct", "confirm", "sure"]
-    ):
-        _commit_meeting_to_db(state)
-        state["scheduling_active"] = False
-        state["conv_state"] = State.COMPLETED
-        return await _llm_reply(
-            "Confirm booking successful and invite sent.", state, user_query, client_id
-        )
-
-    state["sched_pending_confirm"] = True
-    return await _llm_reply(
-        "Summarize meeting details and ask for confirmation.",
-        state,
-        user_query,
-        client_id,
+        "Apologize you couldn't check availability.", state, query, client_id
     )
 
 
 async def _handle_directory_lookup(
-    client_id: str, user_query: str, state: Dict[str, Any]
+    state: Dict[str, Any], query: str, client_id: str
 ) -> str:
-
-    search_term = user_query.lower()
-    for word in ["who", "is", "the", "manager", "director", "of", "this", "company"]:
-        search_term = search_term.replace(word, "").strip()
-
-    emp = _lookup_employee(search_term or user_query)
+    emp = _lookup_employee(query)
     if emp:
-        state["meeting_with_raw"] = emp.name
         state["meeting_with_resolved"] = emp.name
-        situation = f"Tell them our {emp.role or emp.department} is {emp.name}. They are located at {emp.location or 'the main office area'}."
-    else:
-        situation = "Apologize and say you couldn't find them, but offer to notify the Admin team."
-    return await _llm_reply(situation, state, user_query, client_id)
+        return await _llm_reply(
+            f"Tell them {emp.name} is the {emp.role} at {emp.location}.",
+            state,
+            query,
+            client_id,
+        )
+    return await _llm_reply(
+        "Apologize politely that you couldn't find them.", state, query, client_id
+    )
+
+
+async def _finalize_checkin_and_respond(
+    state: Dict[str, Any], query: str, client_id: str
+) -> str:
+    if not state.get("visitor_name"):
+        return await _llm_reply("Ask for their name politely.", state, query, client_id)
+    current_host = state["meeting_with_resolved"] or "Administration Team"
+    if current_host not in state["notified_hosts"]:
+        send_slack_arrival(
+            current_host,
+            state["visitor_name"],
+            state["visitor_type"],
+            state.get("purpose", "Arrival"),
+            state["session_id"],
+        )
+        state["notified_hosts"].add(current_host)
+        _commit_checkin(state)
+    state["conv_state"] = State.COMPLETED
+    situation = f"Confirm {current_host} is notified."
+    situation += (
+        " Tell them to leave the item."
+        if "Delivery" in state["visitor_type"]
+        else " Ask to wait in lobby."
+    )
+    return await _llm_reply(situation, state, query, client_id)
+
+
+async def _handle_scheduling(
+    client_id: str, query: str, state: Dict[str, Any], intent: str
+) -> str:
+    if not state.get("visitor_name"):
+        return await _llm_reply("Ask for their name.", state, query, client_id)
+    if not state.get("sched_employee_name"):
+        return await _llm_reply("Ask who they want to meet.", state, query, client_id)
+    if not state.get("sched_date"):
+        return await _llm_reply("Ask for the date.", state, query, client_id)
+    if not state.get("sched_time"):
+        return await _llm_reply("Ask for the time.", state, query, client_id)
+    slots = get_available_slots(state["sched_employee_name"], state["sched_date"])
+    if state["sched_time"] not in slots:
+        return await _llm_reply(
+            f"Suggest alternate slots: {', '.join(slots[:3])}.", state, query, client_id
+        )
+    if intent == "confirm" or any(
+        x in query.lower() for x in ["okay", "yes", "correct", "book"]
+    ):
+        if _finalize_meeting_and_log(state):
+            state["scheduling_active"], state["conv_state"] = False, State.COMPLETED
+            return await _llm_reply(
+                "Confirm booking successful.", state, query, client_id
+            )
+    return await _llm_reply(
+        f"Verify meeting with {state['sched_employee_name']} at {state['sched_time']}. Proceed?",
+        state,
+        query,
+        client_id,
+    )
 
 
 async def route_query(client_id: str, user_query: str) -> str:
     state = get_session_state(client_id)
     llm = GroqProcessor.get_instance()
-    query_clean = user_query.lower().strip()
-
-    # 1. Wake word (File A)
-    if any(
-        x in query_clean for x in ["hey jarvis", "hi jarvis", "wake_word_triggered"]
-    ):
+    query_low = user_query.lower().strip()
+    if any(x in query_low for x in WAKE_WORDS):
         clear_session_state(client_id)
-        # Manually return greeting only on wake
         state = get_session_state(client_id)
-        from datetime import datetime
-
-        hour = datetime.now().hour
-        greet = (
-            "Good Morning"
-            if 5 <= hour < 12
-            else "Good Afternoon" if 12 <= hour < 17 else "Good Evening"
-        )
-        state["greeting_sent"] = True
-        return f"{greet}! Welcome to {COMPANY_NAME}. I am {AI_NAME}, how can I help you today?"
-
+        state["greeted"] = True
+        return f"{_get_time_greeting()}! Welcome to {COMPANY_NAME}. I am {AI_NAME}, how can I assist you today?"
     extracted = await llm.extract_intent_and_entities(user_query)
-    entities = extracted.get("entities", {})
-    intent = extracted.get("intent", "general")
-
-    _merge_checkin_entities(state, entities, user_query, intent)
-
-    # 2. Terminal Goodbye
-    if any(w in query_clean for w in ["thank you", "thanks", "bye"]):
+    intent, entities = extracted.get("intent", "general"), extracted.get("entities", {})
+    _merge_checkin_entities(state, entities, user_query)
+    if any(
+        x in query_low for x in ["don't know", "do not know", "anyone", "notify admin"]
+    ):
+        state["force_admin"] = True
+        state["meeting_with_resolved"] = "Administration Team"
+    if any(w in query_low for w in ["thank you", "thanks", "bye", "goodbye"]):
         reply = await llm.get_raw_response(
-            f"The user said '{user_query}'. Warm closing.", client_id=client_id
+            f"Warm closing for: {user_query}", client_id=client_id
         )
         clear_session_state(client_id)
         return reply
-
-    # 3. Flow Routing
+    if any(x in query_low for x in ["free time", "available", "is he free"]):
+        return await _handle_availability_check(state, user_query, client_id)
     if intent == "employee_lookup" or any(
-        x in query_clean for x in ["who is", "where is"]
+        x in query_low for x in ["who is", "director", "ceo"]
     ):
-        return await _handle_directory_lookup(client_id, user_query, state)
-
+        return await _handle_directory_lookup(state, user_query, client_id)
     if intent == "schedule_meeting" or state["scheduling_active"]:
         state["scheduling_active"] = True
-        return await _handle_scheduling(client_id, user_query, state, entities, intent)
-
-    if (
-        intent == "check_in"
-        or state["meeting_with_raw"]
-        or state["meeting_with_resolved"]
-    ):
-        return await _advance_checkin(state, user_query, client_id)
-
-    # General Chat logic
-    reply = await llm.get_response(
+        if (
+            state["visitor_name"]
+            and state["sched_employee_name"]
+            and state["sched_date"]
+            and state["sched_time"]
+        ):
+            if _finalize_meeting_and_log(state):
+                state["scheduling_active"], state["conv_state"] = False, State.COMPLETED
+                return await _llm_reply(
+                    f"Confirmed meeting with {state['sched_employee_name']}.",
+                    state,
+                    user_query,
+                    client_id,
+                )
+        return await _handle_scheduling(client_id, user_query, state, intent)
+    if intent == "check_in" or state["meeting_with_resolved"]:
+        if state.get("is_employee"):
+            return await _llm_reply(
+                "Wish staff a great day.", state, user_query, client_id
+            )
+        return await _finalize_checkin_and_respond(state, user_query, client_id)
+    return await llm.get_response(
         client_id, user_query, company_info={"visitor_name": state["visitor_name"]}
     )
     state["greeting_sent"] = True
     return reply
 
 
-# 4. FIX THE "WHO DO YOU WANT TO MEET" LOOP
-async def _advance_checkin(
-    state: Dict[str, Any], user_query: str, client_id: str
+async def _llm_reply(
+    situation: str, state: Dict[str, Any], user_query: str, client_id: str
 ) -> str:
-    # Resolve host
-    host = state.get("meeting_with_resolved") or state.get("meeting_with_raw")
-    if not host and state.get("meeting_with_raw"):
-        emp = _lookup_employee(state["meeting_with_raw"])
-        if emp:
-            state["meeting_with_resolved"] = emp.name
-            host = emp.name
-
-    # Check for Identity Switch or Arrival (File A)
-    if state.get("visitor_name") and host:
-        if state["conv_state"] != State.COMPLETED or state.get("identity_updated"):
-            _commit_checkin(state, client_id, user_query)
-            state["conv_state"] = State.COMPLETED
-            state["identity_updated"] = False
-        return await _llm_reply(
-            f"Acknowledge arrival. Confirm {host} has been notified via Slack.",
-            state,
-            user_query,
-            client_id,
-        )
-
-    if not state.get("visitor_name"):
-        return await _llm_reply("Ask for their name.", state, user_query, client_id)
-    if not host:
-        return await _llm_reply(
-            "Ask who they are here to see.", state, user_query, client_id
-        )
-    return await _llm_reply("Assist with check-in.", state, user_query, client_id)
-
-
-async def _complete_checkin(
-    state: Dict[str, Any], user_query: str, client_id: str
-) -> str:
-    """Modified to fix the argument mismatch when calling _commit_checkin."""
-    # FIXED: Added user_query to the call to match function definition
-    _commit_checkin(state, client_id, user_query)
-    state["conv_state"] = State.COMPLETED
-    host = state.get("meeting_with_resolved") or state.get("meeting_with_raw")
-    return await _llm_reply(
-        f"Tell them to leave the package. You will ping {host} immediately.",
-        state,
-        user_query,
-        client_id,
+    llm = GroqProcessor.get_instance()
+    visitor = state.get("visitor_name") or "Visitor"
+    host = (
+        state.get("meeting_with_resolved")
+        or state.get("sched_employee_name")
+        or "Admin"
     )
+    info = f"TALKING TO: {visitor} | HOST: {host} | STATUS: {state['conv_state']}"
+    is_first = not state.get("greeted", False)
+    prompt = f"{BASE_SYSTEM_PROMPT}\nKB: {info}\nRULES: {'Greet warmly' if is_first else 'DO NOT greet again'}. GOAL: {situation}\nUSER: {user_query}"
+    resp = await llm.get_raw_response(prompt, client_id=client_id)
+    state["greeted"] = True
+    return resp
