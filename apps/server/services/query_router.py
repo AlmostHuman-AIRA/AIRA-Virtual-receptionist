@@ -242,32 +242,45 @@ def _normalize_time(raw: str) -> Optional[str]:
 
 
 def _lookup_employee(search_term: str) -> Optional[Employee]:
-    """FIX: Maps 'Admin' phrases and handles role-based searches like 'CEO'."""
+    """Smart lookup: Searches Role, Name, and Department.
+    Crucial for matching 'Lead Engineer' or 'HR Manager' correctly."""
     if not search_term or len(str(search_term)) < 2:
         return None
+
+    # Strip noise but keep core keywords like 'Lead', 'HR', 'CEO'
     clean = re.sub(
-        r"\b(the|is|who|of|this|company|with|for|at|his|her|name|hr|manager|engineer|lead|ceo)\b",
+        r"\b(the|is|who|of|this|company|with|for|at|his|her|name|cabin|room|manager)\b",
         "",
         str(search_term).lower(),
     ).strip()
 
-    # Direct mapping for Vikram's case
+    # Direct Admin Team mapping
     if clean in ["admin", "administration", "front desk", "anyone"]:
-        return Employee(name="Administration Team", email=None, id=None)
+        return Employee(
+            name="Administration Team",
+            email=None,
+            id=None,
+            role="Support",
+            location="Reception",
+        )
 
     db = SessionLocal()
     try:
-        emp = (
-            db.query(Employee)
-            .filter(
-                or_(
-                    Employee.name.ilike(f"%{clean}%"),
-                    Employee.role.ilike(f"%{clean}%"),
-                    Employee.department.ilike(f"%{clean}%"),
-                )
+        # Priority 1: Check by Role (Fixes HR Manager -> Priya, Lead Engineer -> Arjun)
+        emp = db.query(Employee).filter(Employee.role.ilike(f"%{clean}%")).first()
+
+        # Priority 2: Check by Name
+        if not emp:
+            emp = db.query(Employee).filter(Employee.name.ilike(f"%{clean}%")).first()
+
+        # Priority 3: Check by Department
+        if not emp:
+            emp = (
+                db.query(Employee)
+                .filter(Employee.department.ilike(f"%{clean}%"))
+                .first()
             )
-            .first()
-        )
+
         return emp
     finally:
         db.close()
@@ -604,7 +617,7 @@ async def route_query(client_id: str, user_query: str) -> str:
     llm = GroqProcessor.get_instance()
     query_low = user_query.lower().strip()
 
-    # 1. Wake word / Trigger Logic (Preserved + Fuzzy Fixes)
+    # 1. Wake word / Trigger Logic
     if any(x in query_low for x in WAKE_WORDS):
         clear_session_state(client_id)
         state = get_session_state(client_id)
@@ -615,23 +628,19 @@ async def route_query(client_id: str, user_query: str) -> str:
     extracted = await llm.extract_intent_and_entities(user_query)
     intent, entities = extracted.get("intent", "general"), extracted.get("entities", {})
 
-    # Run the merging logic (Handles visitor name, intern type, and host resolution)
     from services.query_router import _merge_checkin_entities
 
     _merge_checkin_entities(state, entities, user_query)
 
-    # 3. Vikram Fix: Handle "Don't know anyone" loop (Smart & Flexible)
+    # 3. Vikram Fix: Handle "Don't know anyone"
     if any(
         x in query_low
         for x in ["don't know", "do not know", "anyone", "just notify admin"]
     ):
         state["force_admin"] = True
         state["meeting_with_resolved"] = "Administration Team"
-        state["visitor_type"] = _determine_visitor_type(
-            user_query, "", state["visitor_type"]
-        )
 
-    # 4. Termination Logic (Preserved)
+    # 4. Termination Logic
     if any(
         w in query_low for w in ["thank you", "thanks", "bye", "goodbye", "shut up"]
     ):
@@ -641,46 +650,77 @@ async def route_query(client_id: str, user_query: str) -> str:
         clear_session_state(client_id)
         return reply
 
-    # 5. Intent: Employee Lookup (Preserved + Role Fix)
+    # 5. RETU FIX: Availability Check (Look up but DON'T notify)
+    # If the user is asking "Are they free" or "Have time", don't trigger a check-in Slack
+    if any(
+        x in query_low for x in ["free time", "available", "is he free", "has time"]
+    ):
+        target = (
+            entities.get("employee_name") or entities.get("employee_role") or query_low
+        )
+        emp = _lookup_employee(target)
+        if emp:
+            slots = get_available_slots(emp.name, datetime.now().strftime("%Y-%m-%d"))
+            slot_str = ", ".join(slots[:3]) if slots else "no more slots today"
+            return await _llm_reply(
+                f"Tell them {emp.name} is the {emp.role}. Free slots: {slot_str}.",
+                state,
+                user_query,
+                client_id,
+            )
+
+    # 6. ISHANI FIX: Role Lookup (Verify who HR Manager is)
     if intent == "employee_lookup" or any(
-        x in query_low for x in ["who is", "director", "ceo", "manager"]
+        x in query_low for x in ["who is", "director", "ceo"]
     ):
         emp = _lookup_employee(user_query)
         if emp:
-            # Context lock the host for the next turn
             state["meeting_with_resolved"] = emp.name
             return await _llm_reply(
-                f"Tell them {emp.name} is the {emp.role}.", state, user_query, client_id
+                f"Tell them {emp.name} is the {emp.role} at {emp.location}.",
+                state,
+                user_query,
+                client_id,
             )
 
-    # 6. Intent: Scheduling (Kapoor Fix - Auto-Commit)
+    # 7. KAPOOR FIX: Scheduling Auto-Commit
     if intent == "schedule_meeting" or state["scheduling_active"]:
         state["scheduling_active"] = True
 
-        # SMART AUTO-COMMIT: If Host + Date + Time are all present, book immediately
-        if state["sched_employee_name"] and state["sched_date"] and state["sched_time"]:
+        # Capture "Next Monday" or specific dates manually if NLU misses it
+        if "next monday" in query_low:
+            state["sched_date"] = (
+                datetime.now() + timedelta(days=(7 - datetime.now().weekday()))
+            ).strftime("%Y-%m-%d")
+
+        # SMART TRIGGER: If we have Name + Host + Date + Time, commit now
+        if (
+            state["visitor_name"]
+            and state["sched_employee_name"]
+            and state["sched_date"]
+            and state["sched_time"]
+        ):
             if _finalize_meeting_and_log(state):
                 state["scheduling_active"] = False
                 return await _llm_reply(
-                    f"I've successfully booked your meeting with {state['sched_employee_name']} for {state['sched_time']} on {state['sched_date']}.",
+                    f"Successfully booked with {state['sched_employee_name']} for {state['sched_time']} on {state['sched_date']}.",
                     state,
                     user_query,
                     client_id,
                 )
 
-        # Otherwise, continue collecting info
         return await _handle_scheduling(client_id, user_query, state, entities, intent)
 
-    # 7. Intent: Check-in / Arrival (Zomato/Blanket/Intern Fix)
+    # 8. Check-in / Arrival (Sunil, Megha, Harish)
     if intent == "check_in" or state["meeting_with_resolved"]:
-        # Employee Check-in (Preserved)
         if state.get("is_employee"):
             return await _llm_reply(
                 "Wish the staff member a great day.", state, user_query, client_id
             )
 
-        # Multi-notification logic: Send Slack only if this host hasn't been notified yet
         current_host = state["meeting_with_resolved"] or "Administration Team"
+
+        # Support for Zomato/Blanket: Notify if host is NOT in the notified list
         if current_host not in state.get("notified_hosts", set()):
             send_slack_arrival(
                 current_host,
@@ -693,15 +733,14 @@ async def route_query(client_id: str, user_query: str) -> str:
                 state["notified_hosts"] = set()
             state["notified_hosts"].add(current_host)
 
-            # Commit to Database Log (Stores visitor type as "Intern", "Food Delivery", etc.)
             from services.query_router import _commit_checkin
 
             _commit_checkin(state, client_id, user_query)
 
-        # Smart Response: Check if they are an Intern
+        # Smart Response for Interns
         if state["visitor_type"] == "Intern":
             return await _llm_reply(
-                f"Welcome the new intern and tell them {current_host} is notified.",
+                f"Welcome the new intern. Tell them {current_host} is notified.",
                 state,
                 user_query,
                 client_id,
@@ -709,7 +748,7 @@ async def route_query(client_id: str, user_query: str) -> str:
 
         return await _advance_checkin(state, user_query, client_id)
 
-    # 8. Default Chat Fallback (Preserved)
+    # 9. Default Fallback
     return await llm.get_response(
         client_id, user_query, company_info={"visitor_name": state["visitor_name"]}
     )
