@@ -75,23 +75,15 @@ class Meeting(Base):
 
 
 class ReceptionLog(Base):
-    """Unified log for physical check-ins/check-outs at the front desk (Event)."""
-
     __tablename__ = "reception_logs"
-
     id = Column(Integer, primary_key=True, autoincrement=True)
     visitor_id = Column(Integer, ForeignKey("visitors.id"), nullable=True)
     employee_id = Column(Integer, ForeignKey("employees.id"), nullable=True)
-
-    person_type = Column(String, nullable=False)  # 'VISITOR', 'EMPLOYEE', 'DELIVERY'
-    badge_id = Column(
-        String, unique=True, nullable=True
-    )  # Badge belongs to the visit, not the person
-
+    person_type = Column(String, nullable=False)
+    badge_id = Column(String, unique=True, nullable=True)
     check_in_time = Column(DateTime, default=datetime.utcnow)
     check_out_time = Column(DateTime, nullable=True)
-    purpose = Column(String)
-    notes = Column(Text)
+    purpose = Column(String)  # Refined descriptive purpose narrative
 
     # Relationships
     visitor = relationship("Visitor", back_populates="logs")
