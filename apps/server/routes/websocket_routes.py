@@ -130,6 +130,13 @@ _VISITOR_KEYWORDS = (
     "drop off",
     "interview",
     "interviewing",
+    "intern",
+    "internship",
+    "joining",
+    "new joiner",
+    "onboarding",
+    "new employee",
+    "starting today",
 )
 
 
@@ -158,7 +165,7 @@ def _extract_spoken_name(text: str) -> str | None:
         return None
 
     # Capture exactly 1 or 2 words immediately following the intro phrase.
-    name_pattern = r"([A-Za-z'-]+(?:\s+[A-Za-z'-]+)?)"
+    name_pattern = r"([A-Za-z'\-\.]+(?:\s+[A-Za-z'\-\.]+){0,2})"
 
     patterns = [
         rf"\b(?:i am|i'm)\s+{name_pattern}",
@@ -196,33 +203,35 @@ def _extract_spoken_name(text: str) -> str | None:
 
 
 def _candidate_names_from_transcript(text: str) -> list[str]:
-    """
-    Build a short list of candidate names from transcript text.
-    This improves robustness when STT adds extra words around the name.
-    """
     if not text:
         return []
 
+    # Strip meeting-target names FIRST, before any extraction runs.
+    # Prevents "I'm here to meet Priya" from extracting "Priya" as the speaker.
+    safe_text = re.sub(
+        r"\b(meet|see|looking for|appointment with|here for|visiting)\s+([A-Z][a-z.\'-]+)\b",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+
     candidates: list[str] = []
 
-    # 1. Try explicit intro phrases
-    primary = _extract_spoken_name(text)
+    # 1. Try explicit intro phrases — on safe_text, not original text
+    primary = _extract_spoken_name(safe_text)
     if primary:
         candidates.append(primary)
-        # If it captured two words (e.g. "Priya here"), add the first word as a safe fallback ("Priya")
         parts = primary.split()
         if len(parts) > 1:
             candidates.append(parts[0])
 
-    # 2. Fallback: Extract capitalized words (Whisper usually capitalizes proper nouns)
-    # This catches cases where the regex misses but the name is clearly spoken.
-    capitalized_words = re.findall(r"\b[A-Z][a-z.\'-]+\b", text)
+    # 2. Fallback: capitalized words — also on safe_text
+    capitalized_words = re.findall(r"\b[A-Z][a-z.\'-]+\b", safe_text)
     for cw in capitalized_words:
-        # Must be at least 3 chars and not a stopword to count as a name candidate
         if len(cw) >= 3 and cw.lower() not in _NAME_STOPWORDS:
             candidates.append(cw)
 
-    # Preserve order while removing duplicates.
+    # Preserve order, remove duplicates
     seen = set()
     unique: list[str] = []
     for candidate in candidates:
