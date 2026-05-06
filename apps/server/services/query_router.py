@@ -155,13 +155,17 @@ def _fresh_state() -> Dict[str, Any]:
         "last_active": datetime.utcnow(),
         "visitor_name": None,
         "visitor_email": None,
+        "visitor_email": None,
         "visitor_type": "Visitor/Guest",
+        "greeting_sent": False,  # FIX: Prevent repeating "Good Morning"
         "meeting_with_raw": None,
         "meeting_with_resolved": None,
+        "host_details": None,  # Store role for Slack
         "is_employee": False,
         "purpose": None,
         "scheduling_active": False,
         "sched_employee_name": None,
+        "sched_employee_email": None,
         "sched_employee_email": None,
         "sched_date": None,
         "sched_time": None,
@@ -596,6 +600,8 @@ async def route_query(client_id: str, user_query: str) -> str:
     return await llm.get_response(
         client_id, user_query, company_info={"visitor_name": state["visitor_name"]}
     )
+    state["greeting_sent"] = True
+    return reply
 
 
 async def _llm_reply(

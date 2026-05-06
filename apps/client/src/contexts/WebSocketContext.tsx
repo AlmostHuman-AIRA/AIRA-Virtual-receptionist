@@ -16,6 +16,8 @@ interface WordTiming {
   end_time: number;
 }
 
+type TimingPayload = unknown;
+
 interface WebSocketMessage {
   status?: string;
   client_id?: string;
@@ -28,6 +30,20 @@ interface WebSocketMessage {
   error?: string;
   type?: string;
   state?: string;
+  name?: string;
+  verified?: boolean;
+  distance?: number;
+  audio_name?: string;
+  has_photo?: boolean;
+  message?: string;
+  person_type?: 'employee' | 'visitor';
+  session_action?: 'capture_reference' | 'compare_reference';
+  reference_captured?: boolean;
+}
+
+export interface FaceVerificationRequestOptions {
+  personType?: 'employee' | 'visitor';
+  sessionAction?: 'capture_reference' | 'compare_reference';
 }
 
 interface WebSocketContextType {
@@ -42,7 +58,7 @@ interface WebSocketContextType {
   onAudioReceived: (
     callback: (
       audioData: string,
-      timingData?: any,
+      timingData?: TimingPayload,
       sampleRate?: number,
       method?: string
     ) => void
@@ -57,6 +73,15 @@ interface WebSocketContextType {
       state: 'passive' | 'listening' | 'processing' | 'speaking'
     ) => void
   ) => void;
+  sendFaceVerificationRequest?: (
+    audioName: string,
+    imageB64: string,
+    options?: FaceVerificationRequestOptions
+  ) => void;
+  onVerificationResult?: (callback: (data: WebSocketMessage) => void) => void;
+  onEmployeeIdentified?: (callback: (employeeName: string) => void) => void;
+  onRequestFaceFrame?: (callback: (data: WebSocketMessage) => void) => void;
+  onStateChange?: (callback: (state: string) => void) => void;
 }
 
 const WebSocketContext = createContext<WebSocketContextType | null>(null);
@@ -97,7 +122,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({
   const audioReceivedCallbackRef = useRef<
     | ((
         audioData: string,
-        timingData?: any,
+        timingData?: TimingPayload,
         sampleRate?: number,
         method?: string
       ) => void)
@@ -112,6 +137,16 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({
     | ((state: 'passive' | 'listening' | 'processing' | 'speaking') => void)
     | null
   >(null);
+  const faceVerificationResultCallbackRef = useRef<
+    ((data: WebSocketMessage) => void) | null
+  >(null);
+  const employeeIdentifiedCallbackRef = useRef<
+    ((employeeName: string) => void) | null
+  >(null);
+  const requestFaceFrameCallbackRef = useRef<
+    ((data: WebSocketMessage) => void) | null
+  >(null);
+  const stateChangeCallbackRef = useRef<((state: string) => void) | null>(null);
 
   const connect = useCallback(async () => {
     if (wsRef.current?.readyState === WebSocket.OPEN) return;
@@ -141,10 +176,34 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({
             );
           }
 
+          if (data.status === 'connected') {
+            console.log(
+              `Server confirmed connection. Client ID: ${data.client_id}`
+            );
+          }
+
+          if (data.type === 'face_verification_result') {
+            console.log('Received face verification result:', data);
+            faceVerificationResultCallbackRef.current?.(data);
+          }
+
+          if (data.type === 'request_face_frame') {
+            console.log('📸 Backend requested a face frame:', data);
+            requestFaceFrameCallbackRef.current?.(data);
+          }
+
+          if (
+            data.type === 'employee_identified' &&
+            typeof data.name === 'string'
+          ) {
+            employeeIdentifiedCallbackRef.current?.(data.name);
+          }
+
           if (data.state) {
             serverStateCallbackRef.current?.(
               data.state as 'passive' | 'listening' | 'processing' | 'speaking'
             );
+            stateChangeCallbackRef.current?.(data.state);
           }
 
           if (data.interrupt) {
@@ -200,7 +259,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({
           if (data.type === 'ping') {
             // Keepalive ping - no action needed
           }
-        } catch (e) {
+        } catch {
           console.log('Non-JSON message:', event.data);
         }
       };
@@ -216,7 +275,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({
         statusChangeCallbackRef.current?.('disconnected');
         console.log('WebSocket disconnected');
       };
-    } catch (error) {
+    } catch {
       setIsConnecting(false);
       errorCallbackRef.current?.('Failed to connect to WebSocket server');
     }
@@ -276,12 +335,65 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({
     []
   );
 
+  const sendFaceVerificationRequest = useCallback(
+    (
+      audioName: string,
+      imageB64: string,
+      options?: FaceVerificationRequestOptions
+    ) => {
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        const personType = options?.personType ?? 'employee';
+        const sessionAction =
+          options?.sessionAction ??
+          (personType === 'visitor' ? 'compare_reference' : undefined);
+        wsRef.current.send(
+          JSON.stringify({
+            type: 'verify_face',
+            audio_name: audioName,
+            image_b64: imageB64,
+            person_type: personType,
+            ...(sessionAction ? { session_action: sessionAction } : {})
+          })
+        );
+        console.log(
+          `Sent face verification request for: ${audioName} (${personType}${sessionAction ? `:${sessionAction}` : ''})`
+        );
+      }
+    },
+    []
+  );
+
+  const onRequestFaceFrame = useCallback(
+    (callback: (data: WebSocketMessage) => void) => {
+      requestFaceFrameCallbackRef.current = callback;
+    },
+    []
+  );
+
+  const onStateChange = useCallback((callback: (state: string) => void) => {
+    stateChangeCallbackRef.current = callback;
+  }, []);
+
   // Callback registration methods
+  const onVerificationResult = useCallback(
+    (callback: (data: WebSocketMessage) => void) => {
+      faceVerificationResultCallbackRef.current = callback;
+    },
+    []
+  );
+
+  const onEmployeeIdentified = useCallback(
+    (callback: (employeeName: string) => void) => {
+      employeeIdentifiedCallbackRef.current = callback;
+    },
+    []
+  );
+
   const onAudioReceived = useCallback(
     (
       callback: (
         audioData: string,
-        timingData?: any,
+        timingData?: TimingPayload,
         sampleRate?: number,
         method?: string
       ) => void
@@ -332,7 +444,12 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({
     onInterrupt,
     onError,
     onStatusChange,
-    onServerState
+    onServerState,
+    sendFaceVerificationRequest,
+    onVerificationResult,
+    onEmployeeIdentified,
+    onRequestFaceFrame,
+    onStateChange
   };
 
   return (

@@ -31,7 +31,6 @@ RULES:
 3. NO FILLER: Avoid 'Certainly!', 'I understand', or 'Let me help you with that'.
 4. CONTEXT: If you know the visitor's name, use it.
 """
-
 # Detailed NLU Extraction Prompt
 EXTRACT_SYSTEM = """You are an information extraction engine. Return ONLY valid JSON.
 {
