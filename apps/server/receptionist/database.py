@@ -179,14 +179,12 @@ def get_or_create_visitor(name: str, session) -> Visitor:
 def log_reception_entry(
     person_name: str,
     person_type: str,
-    notes: str = "",
+    purpose: str = "",  # Use purpose narrative here
     linked_visitor_id: Optional[int] = None,
     linked_employee_id: Optional[int] = None,
 ) -> int:
-    """Legacy function brought back: Logs an ad-hoc reception entry."""
     session = SessionLocal()
     try:
-        # If they didn't pass a linked ID but provided a name, map them to a Visitor profile
         if not linked_visitor_id and not linked_employee_id and person_name:
             visitor = get_or_create_visitor(person_name, session)
             linked_visitor_id = visitor.id
@@ -195,7 +193,7 @@ def log_reception_entry(
             visitor_id=linked_visitor_id,
             employee_id=linked_employee_id,
             person_type=person_type,
-            notes=notes,
+            purpose=purpose,
             check_in_time=datetime.utcnow(),
         )
         session.add(entry)

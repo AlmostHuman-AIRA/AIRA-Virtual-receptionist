@@ -7,36 +7,39 @@ WAKE_WORD_GREETING = (
 )
 
 
+from services.query_router import route_query, clear_session_state
+
+
+from datetime import datetime
+
+
 async def process_text_for_client(client_id: str, text: str) -> str:
-    """
-    Process a user utterance and return the assistant response text.
-    """
-    if not text or not text.strip():
+    if not text:
         return ""
 
-    if text == WAKE_WORD_TRIGGER_TEXT:
-        try:
-            from services.query_router import clear_session_state
-            from models.groq_processor import GroqProcessor
+    if text == "WAKE_WORD_TRIGGERED":
+        from services.query_router import clear_session_state, get_session_state
 
-            # 1. Reset the session so we start completely fresh on a wake word
-            clear_session_state(client_id, retain_name=False)
+        clear_session_state(client_id)
 
-            # 2. Inject the hardcoded greeting into the LLM's memory
-            # This tells the LLM it ALREADY welcomed the user, preventing repeats!
-            llm = GroqProcessor.get_instance()
-            llm.client_history[client_id].append(
-                {"role": "assistant", "content": WAKE_WORD_GREETING}
-            )
-        except Exception as e:
-            logger.error(f"Failed to inject wake word context: {e}")
+        # Precise Time Logic
+        hour = datetime.now().hour
+        if 5 <= hour < 12:
+            greeting = "Good Morning"
+        elif 12 <= hour < 17:
+            greeting = "Good Afternoon"
+        else:
+            greeting = "Good Evening"
 
-        return WAKE_WORD_GREETING
+        state = get_session_state(client_id)
+        state["greeted"] = True  # Mark as greeted so router doesn't repeat it
+
+        return f"{greeting}! Welcome to Sharp Software Development India Private Limited. I am Jarvis, how can I assist you today?"
 
     try:
         from services.query_router import route_query
 
         return await route_query(client_id, text)
     except Exception as exc:
-        logger.error("route_query failed: %s", exc, exc_info=True)
+        logger.error(f"Routing Error: {exc}")
         return "I'm sorry, I'm having trouble connecting to my systems."
