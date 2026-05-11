@@ -11,7 +11,9 @@ import torch
 import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from services.slack_webhook_receiver import router as slack_router
 
+#   app.include_router(slack_router)
 from core.config import logger
 from core.lifespan import lifespan
 

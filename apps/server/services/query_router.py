@@ -18,6 +18,7 @@ from receptionist.models import Employee, Visitor, Meeting, ReceptionLog
 from models.groq_processor import BASE_SYSTEM_PROMPT, GroqProcessor
 from services.notify_slack import send_slack_arrival, clear_session as clear_slack_cache
 from services.calendar_service import schedule_google_meeting_background
+from services.slack_reply_store import pop_reply
 
 # Logger Configuration
 logger = logging.getLogger(__name__)
@@ -150,22 +151,20 @@ def clear_session_state(client_id: str) -> None:
 
 def _fresh_state() -> Dict[str, Any]:
     return {
-        "session_id": str(uuid.uuid4()),
-        "conv_state": State.INIT,
-        "last_active": datetime.utcnow(),
+        "session_id": str(__import__("uuid").uuid4()),
+        "conv_state": "INIT",
+        "last_active": __import__("datetime").datetime.utcnow(),
         "visitor_name": None,
         "visitor_email": None,
-        "visitor_email": None,
         "visitor_type": "Visitor/Guest",
-        "greeting_sent": False,  # FIX: Prevent repeating "Good Morning"
+        "greeting_sent": False,
         "meeting_with_raw": None,
         "meeting_with_resolved": None,
-        "host_details": None,  # Store role for Slack
+        "host_details": None,
         "is_employee": False,
         "purpose": None,
         "scheduling_active": False,
         "sched_employee_name": None,
-        "sched_employee_email": None,
         "sched_employee_email": None,
         "sched_date": None,
         "sched_time": None,
@@ -174,6 +173,7 @@ def _fresh_state() -> Dict[str, Any]:
         "notified_hosts": set(),
         "greeted": False,
         "force_admin": False,
+        "awaiting_slack_reply": False,  # ← NEW
     }
 
 
@@ -487,13 +487,15 @@ async def _handle_directory_lookup(
     )
 
 
-async def _finalize_checkin_and_respond(
-    state: Dict[str, Any], query: str, client_id: str
-) -> str:
+async def _finalize_checkin_and_respond_UPDATED(state, query, client_id):
     if not state.get("visitor_name"):
         return await _llm_reply("Ask for their name politely.", state, query, client_id)
+
     current_host = state["meeting_with_resolved"] or "Administration Team"
+
     if current_host not in state["notified_hosts"]:
+        from services.notify_slack import send_slack_arrival
+
         send_slack_arrival(
             current_host,
             state["visitor_name"],
@@ -502,8 +504,10 @@ async def _finalize_checkin_and_respond(
             state["session_id"],
         )
         state["notified_hosts"].add(current_host)
+        state["awaiting_slack_reply"] = True  # ← NEW: start waiting
         _commit_checkin(state)
-    state["conv_state"] = State.COMPLETED
+
+    state["conv_state"] = "COMPLETED"
     situation = f"Confirm {current_host} is notified."
     situation += (
         " Tell them to leave the item."
@@ -546,34 +550,67 @@ async def _handle_scheduling(
 
 
 async def route_query(client_id: str, user_query: str) -> str:
+    from receptionist.database import get_company_details
+    from models.groq_processor import GroqProcessor, BASE_SYSTEM_PROMPT
+
     state = get_session_state(client_id)
     llm = GroqProcessor.get_instance()
     query_low = user_query.lower().strip()
+
+    # Wake word → fresh session
     if any(x in query_low for x in WAKE_WORDS):
         clear_session_state(client_id)
         state = get_session_state(client_id)
         state["greeted"] = True
-        return f"{_get_time_greeting()}! Welcome to {COMPANY_NAME}. I am {AI_NAME}, how can I assist you today?"
+        return (
+            f"{_get_time_greeting()}! Welcome to {COMPANY_NAME}. "
+            f"I am {AI_NAME}, how can I assist you today?"
+        )
+
     extracted = await llm.extract_intent_and_entities(user_query)
-    intent, entities = extracted.get("intent", "general"), extracted.get("entities", {})
+    intent = extracted.get("intent", "general")
+    entities = extracted.get("entities", {})
     _merge_checkin_entities(state, entities, user_query)
+
+    # ── CHECK FOR PENDING SLACK REPLY ──────────────────────────────────────
+    if state.get("awaiting_slack_reply"):
+        host_name = state.get("meeting_with_resolved") or state.get(
+            "sched_employee_name"
+        )
+        if host_name:
+            slack_reply = pop_reply(host_name)  # None if not arrived yet
+            if slack_reply:
+                state["awaiting_slack_reply"] = False
+                situation = (
+                    f"{host_name} replied via Slack with the following message: "
+                    f'"{slack_reply}". '
+                    f"Relay this message naturally and helpfully to the visitor."
+                )
+                return await _llm_reply(situation, state, user_query, client_id)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    # ── rest of the existing routing logic (unchanged) ────────────────────
     if any(
         x in query_low for x in ["don't know", "do not know", "anyone", "notify admin"]
     ):
         state["force_admin"] = True
         state["meeting_with_resolved"] = "Administration Team"
+
     if any(w in query_low for w in ["thank you", "thanks", "bye", "goodbye"]):
         reply = await llm.get_raw_response(
             f"Warm closing for: {user_query}", client_id=client_id
         )
         clear_session_state(client_id)
         return reply
+
     if any(x in query_low for x in ["free time", "available", "is he free"]):
         return await _handle_availability_check(state, user_query, client_id)
+
     if intent == "employee_lookup" or any(
         x in query_low for x in ["who is", "director", "ceo"]
     ):
         return await _handle_directory_lookup(state, user_query, client_id)
+
     if intent == "schedule_meeting" or state["scheduling_active"]:
         state["scheduling_active"] = True
         if (
@@ -591,12 +628,14 @@ async def route_query(client_id: str, user_query: str) -> str:
                     client_id,
                 )
         return await _handle_scheduling(client_id, user_query, state, intent)
+
     if intent == "check_in" or state["meeting_with_resolved"]:
         if state.get("is_employee"):
             return await _llm_reply(
                 "Wish staff a great day.", state, user_query, client_id
             )
         return await _finalize_checkin_and_respond(state, user_query, client_id)
+
     return await llm.get_response(
         client_id, user_query, company_info={"visitor_name": state["visitor_name"]}
     )
