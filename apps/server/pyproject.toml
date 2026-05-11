@@ -38,6 +38,7 @@ dependencies = [
     "mtcnn",                      # <--- ADDED: Required for FACE_VERIFY_DETECTOR=mtcnn
     "tensorflow-cpu",             # <--- ADDED: Forces CPU-only to avoid GPU/CUDA headaches
     "opencv-python-headless",     # <--- ADDED: Safer for server environments (avoids libGL errors)
+    "mediapipe>=0.10.0",          # Face detection for presence-based activation (replaces wake word)
 
 ]
 

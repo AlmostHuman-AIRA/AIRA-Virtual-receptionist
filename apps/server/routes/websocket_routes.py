@@ -22,15 +22,19 @@ from services.wake_word_service import get_wake_word_service
 
 # --- Other imports remain the same ---
 from services.face_recognition_service import verify_person_face, warmup_deepface
+from services.person_detection_service import (
+    get_person_detection_service,
+    warmup_mediapipe,
+)
 
-# Thread pool for running blocking DeepFace calls without blocking the async event loop.
-# 2 workers: one for _resolve_employee_name (DB fuzzy lookup) and one for verify_person_face
-# (DeepFace). With only 1 worker, a DB lookup submitted first can starve the face verification
-# submitted immediately after, causing the session to time out before the camera frame arrives.
-_face_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="deepface")
+# Thread pool for running blocking calls without blocking the async event loop.
+# 3 workers: _resolve_employee_name (DB), verify_person_face (DeepFace),
+# and detect_person (MediaPipe presence detection).
+_face_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="deepface")
 
-# Trigger model warmup immediately when the server file is loaded
+# Trigger model warmups immediately when the server file is loaded
 _face_executor.submit(warmup_deepface)
+_face_executor.submit(warmup_mediapipe)
 
 logging.basicConfig(
     # ... rest of your code ...
@@ -53,6 +57,10 @@ SILERO_WINDOW_SAMPLES = 8000
 MAX_SILENCE_MS = 1200
 FOLLOWUP_TIMEOUT_SECONDS = float(os.getenv("FOLLOWUP_TIMEOUT", "12.0"))
 MAX_MISMATCH_STRIKES = 3
+
+# ── Presence detection (MediaPipe) ────────────────────────────────────────────
+PRESENCE_CONFIRM_FRAMES = int(os.getenv("PRESENCE_CONFIRM_FRAMES", "3"))
+PRESENCE_FRAME_COOLDOWN = float(os.getenv("PRESENCE_FRAME_COOLDOWN", "5.0"))
 
 _NAME_STOPWORDS = frozenset(
     {
@@ -293,6 +301,8 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
         "conversation_complete": False,
         "visitor_captured": False,  # ← ADD
         "brain_is_thinking": False,  # ← ADD
+        "presence_count": 0,  # consecutive frames with face detected
+        "last_presence_trigger": 0.0,  # timestamp of last activation (cooldown)
     }
 
     try:
@@ -352,6 +362,8 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                     session_state["person_type"] = "employee"
                     session_state["mismatch_strikes"] = 0
                     session_state["conversation_complete"] = False
+                    session_state["presence_count"] = 0
+                    # NOTE: last_presence_trigger is NOT reset here — cooldown persists
 
                     try:
                         ww_service.model.reset()
@@ -378,6 +390,72 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                 if raw_text:
                     try:
                         msg = json.loads(raw_text)
+
+                        # ── Presence detection frame from frontend ────────────────
+                        # Client sends a low-res JPEG every 1.5 s while AIRA is PASSIVE.
+                        # MediaPipe checks if a face is present and large enough.
+                        if msg.get("type") == "presence_frame":
+                            if session_state["mode"] != "PASSIVE":
+                                continue
+                            # Cooldown: skip if we triggered recently
+                            if (
+                                time.time() - session_state["last_presence_trigger"]
+                                < PRESENCE_FRAME_COOLDOWN
+                            ):
+                                continue
+                            image_b64 = msg.get("image_b64", "")
+                            if not image_b64:
+                                continue
+
+                            detection_service = get_person_detection_service()
+                            loop = asyncio.get_event_loop()
+                            result = await loop.run_in_executor(
+                                _face_executor,
+                                lambda: detection_service.detect_person(image_b64),
+                            )
+
+                            if result["detected"]:
+                                session_state["presence_count"] += 1
+                                logger.info(
+                                    f"[{client_id}] Person detected "
+                                    f"(count={session_state['presence_count']}/{PRESENCE_CONFIRM_FRAMES}, "
+                                    f"confidence={result['confidence']:.2f}, "
+                                    f"face_ratio={result['face_ratio']:.3f})"
+                                )
+
+                                if (
+                                    session_state["presence_count"]
+                                    >= PRESENCE_CONFIRM_FRAMES
+                                ):
+                                    logger.info(
+                                        f"[{client_id}] ✅ Person confirmed after "
+                                        f"{PRESENCE_CONFIRM_FRAMES} consecutive frames! "
+                                        f"Activating AIRA."
+                                    )
+                                    session_state["presence_count"] = 0
+                                    session_state["last_presence_trigger"] = time.time()
+                                    session_state["mode"] = "PROCESSING"
+
+                                    # Notify frontend
+                                    await websocket.send_text(
+                                        json.dumps({"type": "person_detected"})
+                                    )
+
+                                    # Reuse existing wake-up flow
+                                    await text_queue.put("WAKE_WORD_TRIGGERED")
+                                    oww_carry.clear()
+                                    audio_buffer.clear()
+                                    speech_seen = False
+                            else:
+                                # No face detected — reset streak
+                                if session_state["presence_count"] > 0:
+                                    logger.debug(
+                                        f"[{client_id}] No face detected, "
+                                        f"resetting presence_count from "
+                                        f"{session_state['presence_count']} to 0."
+                                    )
+                                session_state["presence_count"] = 0
+                            continue
 
                         # ── Face verification request from frontend ──────────────
                         # Triggered when the employee says their name and LLM identifies them.

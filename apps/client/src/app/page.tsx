@@ -1,26 +1,45 @@
 'use client';
 
-import { useRef } from 'react';
+import { useRef, useState, useEffect, useCallback } from 'react';
 import Link from 'next/link';
 import VoiceActivityDetector from '@/components/VoiceActivityDetector';
 import TalkingHead from '@/components/TalkingHead';
-import {
-  CameraToggleButton,
-  CameraStreamHandle,
-  CameraToggleButtonHandle
-} from '@/components/CameraStream';
+import CameraStream, { CameraStreamHandle } from '@/components/CameraStream';
 import { useFaceVerification } from '@/hooks/useFaceVerification';
+import { usePresenceDetection } from '@/hooks/usePresenceDetection';
+import { useWebSocketContext } from '@/contexts/WebSocketContext';
 
 export default function Home() {
   const cameraRef = useRef<CameraStreamHandle | null>(null);
-  const cameraToggleRef = useRef<CameraToggleButtonHandle | null>(null);
+  const [serverState, setServerState] = useState<string>('passive');
+  const { onServerState } = useWebSocketContext();
+
+  // Track server state for presence detection
+  useEffect(() => {
+    onServerState((state) => {
+      setServerState(state);
+    });
+  }, [onServerState]);
+
+  // Ensure camera is ready for face verification
+  const ensureCameraReady = useCallback(async () => {
+    // Camera is always on — just check if it can capture a frame
+    for (let attempt = 0; attempt < 20; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      if (cameraRef.current?.captureFrame()) {
+        return true;
+      }
+    }
+    return false;
+  }, []);
+
   const { result, isVerifying, cameraStartupError } = useFaceVerification(
     cameraRef,
-    {
-      ensureCameraReady: async () =>
-        (await cameraToggleRef.current?.ensureCameraReady()) ?? false
-    }
+    { ensureCameraReady }
   );
+
+  // Presence detection — sends frames every 1.5s while PASSIVE
+  const { personDetected } = usePresenceDetection(cameraRef, serverState);
 
   return (
     <main className="relative min-h-screen bg-gradient-to-br from-gray-50 to-gray-100">
@@ -59,8 +78,12 @@ export default function Home() {
         </div>
       </div>
 
-      {/* Floating Camera Component */}
-      <CameraToggleButton ref={cameraToggleRef} cameraRef={cameraRef} />
+      {/* Always-on Camera — auto-starts for presence detection */}
+      <CameraStream
+        ref={cameraRef}
+        autoStartSignal={1}
+        className={personDetected ? 'ring-2 ring-green-400 ring-offset-2' : ''}
+      />
 
       {/* Face verification badge */}
       {(isVerifying || result) && (
