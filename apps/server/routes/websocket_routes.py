@@ -165,15 +165,16 @@ def _extract_spoken_name(text: str) -> str | None:
         return None
 
     # Capture exactly 1 or 2 words immediately following the intro phrase.
-    name_pattern = r"([A-Za-z'\-\.]+(?:\s+[A-Za-z'\-\.]+){0,2})"
+    # Capture 1-2 words: each word is letters/hyphens/apostrophes only.
+    # No dots allowed at end of token — prevents "here." being swallowed.
+    name_pattern = r"([A-Za-z'\-]+(?:\s+[A-Za-z'\-]+)?)"
 
     patterns = [
         rf"\b(?:i am|i'm)\s+{name_pattern}",
         rf"\bmy name is\s+{name_pattern}",
         rf"\bthis is\s+{name_pattern}",
         rf"\bit'?s\s+{name_pattern}",
-        # "Lucy here" — only ONE word before 'here', not two
-        rf"\b([a-zA-Z.'-]+)\s+here\b",
+        rf"\b([a-zA-Z'-]+)\s+here\b",
     ]
     for pattern in patterns:
         match = re.search(pattern, text, flags=re.IGNORECASE)
