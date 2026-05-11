@@ -29,8 +29,8 @@ logger = logging.getLogger(__name__)
 # ── Threshold tuning ──────────────────────────────────────────────────────────
 VERIFY_THRESHOLD = float(os.getenv("FACE_VERIFY_THRESHOLD", "0.68"))
 
-# Change the default fallback from "yolov8" to "mtcnn" or "opencv"
-DETECTOR_BACKEND = os.getenv("FACE_VERIFY_DETECTOR", "mtcnn")
+# Change the default fallback from "yolov8" to "ssd" or "opencv"
+DETECTOR_BACKEND = os.getenv("FACE_VERIFY_DETECTOR", "ssd")
 
 # Model name
 MODEL_NAME = os.getenv("FACE_VERIFY_MODEL", "ArcFace")
