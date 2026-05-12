@@ -1,19 +1,49 @@
 'use client';
 
-import { useRef } from 'react';
+import { useRef, useState, useCallback } from 'react';
 import Link from 'next/link';
 import VoiceActivityDetector from '@/components/VoiceActivityDetector';
 import TalkingHead from '@/components/TalkingHead';
 import {
   CameraToggleButton,
-  CameraStreamHandle,
-  CameraToggleButtonHandle
+  CameraToggleButtonHandle,
+  CameraStreamHandle
 } from '@/components/CameraStream';
 import { useFaceVerification } from '@/hooks/useFaceVerification';
+import { usePresenceDetection } from '@/hooks/usePresenceDetection';
+import { useWebSocketContext } from '@/contexts/WebSocketContext';
 
 export default function Home() {
+  // ── Single camera ref shared between presence detection & face verification ──
+  // CameraToggleButton owns the single CameraStream instance; it exposes
+  // ensureCameraReady() AND forwards captureFrame() via the same cameraRef.
   const cameraRef = useRef<CameraStreamHandle | null>(null);
   const cameraToggleRef = useRef<CameraToggleButtonHandle | null>(null);
+
+  // ── Server state tracking ─────────────────────────────────────────────────
+  const [serverState, setServerState] = useState<
+    'passive' | 'listening' | 'processing' | 'speaking'
+  >('passive');
+
+  // ── Person-detected glow indicator ────────────────────────────────────────
+  const [personJustDetected, setPersonJustDetected] = useState(false);
+
+  // ── WebSocket callbacks ───────────────────────────────────────────────────
+  const { onServerState, onPersonDetected } = useWebSocketContext();
+
+  onServerState(useCallback((state) => setServerState(state), []));
+
+  onPersonDetected(
+    useCallback(() => {
+      setPersonJustDetected(true);
+      setTimeout(() => setPersonJustDetected(false), 3000);
+    }, [])
+  );
+
+  // ── Presence detection loop ───────────────────────────────────────────────
+  usePresenceDetection(cameraRef, serverState);
+
+  // ── Face verification ─────────────────────────────────────────────────────
   const { result, isVerifying, cameraStartupError } = useFaceVerification(
     cameraRef,
     {
@@ -59,8 +89,21 @@ export default function Home() {
         </div>
       </div>
 
-      {/* Floating Camera Component */}
-      <CameraToggleButton ref={cameraToggleRef} cameraRef={cameraRef} />
+      {/*
+        Single floating camera widget.
+        ─────────────────────────────────────────────────────────────────────
+        CameraToggleButton owns the single CameraStream instance. It:
+          1. Auto-starts the camera on page load (autoStart prop)
+          2. Exposes ensureCameraReady() for face verification
+          3. Forwards captureFrame() through cameraRef for presence detection
+        This eliminates the duplicate camera window that appeared before.
+      */}
+      <CameraToggleButton
+        ref={cameraToggleRef}
+        cameraRef={cameraRef}
+        autoStart
+        glowActive={personJustDetected}
+      />
 
       {/* Face verification badge */}
       {(isVerifying || result) && (
@@ -79,8 +122,8 @@ export default function Home() {
               }`}
             >
               {result.verified
-                ? `Identity Confirmed - ${result.audioName}`
-                : 'Identity Mismatch - please confirm'}
+                ? `✅ Identity Confirmed — ${result.audioName}`
+                : '⚠️ Identity Mismatch — please confirm'}
             </div>
           )}
         </div>

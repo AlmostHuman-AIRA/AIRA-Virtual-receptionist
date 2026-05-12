@@ -1,10 +1,23 @@
 from core.config import logger
+from datetime import datetime
 
 WAKE_WORD_TRIGGER_TEXT = "WAKE_WORD_TRIGGERED"
-WAKE_WORD_GREETING = (
-    "Welcome to Sharp Software Development India Private Limited. "
-    "I am Jarvis, how can I assist you today?"
-)
+
+
+def get_dynamic_greeting():
+    """Generates a greeting based on the current time in India."""
+    hour = datetime.now().hour
+    if 5 <= hour < 12:
+        period = "morning"
+    elif 12 <= hour < 17:
+        period = "afternoon"
+    else:
+        period = "evening"
+
+    return (
+        f"Good {period}. Welcome to Sharp Software Development India Private Limited. "
+        "I am Jarvis, how can I assist you today?"
+    )
 
 
 async def process_text_for_client(client_id: str, text: str) -> str:
@@ -22,16 +35,18 @@ async def process_text_for_client(client_id: str, text: str) -> str:
             # 1. Reset the session so we start completely fresh on a wake word
             clear_session_state(client_id, retain_name=False)
 
+            greeting = get_dynamic_greeting()
+
             # 2. Inject the hardcoded greeting into the LLM's memory
             # This tells the LLM it ALREADY welcomed the user, preventing repeats!
             llm = GroqProcessor.get_instance()
             llm.client_history[client_id].append(
-                {"role": "assistant", "content": WAKE_WORD_GREETING}
+                {"role": "assistant", "content": greeting}
             )
         except Exception as e:
             logger.error(f"Failed to inject wake word context: {e}")
 
-        return WAKE_WORD_GREETING
+        return get_dynamic_greeting()
 
     try:
         from services.query_router import route_query

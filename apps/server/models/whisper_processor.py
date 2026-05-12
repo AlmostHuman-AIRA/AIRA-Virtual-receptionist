@@ -35,7 +35,7 @@ class WhisperProcessor:
         )
         # Threshold for raw audio volume (0.0 to 1.0)
         # If the average volume is below this, we don't even transcribe.
-        self.MIN_ENERGY_THRESHOLD = 0.004
+        self.MIN_ENERGY_THRESHOLD = 0.002
 
         # Common Whisper hallucinations during silence
 
@@ -60,28 +60,28 @@ class WhisperProcessor:
 
                 segments, info = self.model.transcribe(
                     audio_array,
-                    vad_filter=True,
+                    vad_filter=False,
                     vad_parameters=dict(min_silence_duration_ms=500),
-                    no_speech_threshold=0.6,
-                    log_prob_threshold=-1.0,
+                    no_speech_threshold=0.5,
+                    # log_prob_threshold=-1.0,
                     beam_size=5,
                 )
 
                 # 🔴 ADD LANGUAGE GATE HERE
-                if info.language_probability < 0.88:
+                if info.language_probability < 0.5:
                     logger.info(
                         f"Low language probability: {info.language_probability:.3f}"
                     )
-                    return ""
+                    return "NO_SPEECH"
 
                 valid_text = []
 
                 for segment in segments:
 
-                    if segment.no_speech_prob > 0.6:
+                    if segment.no_speech_prob > 0.7:
                         continue
 
-                    if segment.avg_logprob < -1.0:
+                    if segment.avg_logprob < -2.0:
                         continue
 
                     if (segment.end - segment.start) < 0.5:

@@ -431,10 +431,17 @@ export const CameraToggleButton = forwardRef<
   {
     onStreamChange?: (stream: MediaStream | null) => void;
     cameraRef?: React.RefObject<CameraStreamHandle | null>;
+    /** If true, the camera widget opens and starts automatically on mount. */
+    autoStart?: boolean;
+    /** When true, adds a green glow ring to the camera widget (person detected). */
+    glowActive?: boolean;
   }
->(function CameraToggleButton({ onStreamChange, cameraRef }, ref) {
-  const [showCamera, setShowCamera] = useState(false);
-  const [autoStartSignal, setAutoStartSignal] = useState(0);
+>(function CameraToggleButton(
+  { onStreamChange, cameraRef, autoStart = false, glowActive = false },
+  ref
+) {
+  const [showCamera, setShowCamera] = useState(autoStart);
+  const [autoStartSignal, setAutoStartSignal] = useState(autoStart ? 1 : 0);
 
   const ensureCameraReady = useCallback(async () => {
     if (!showCamera) {
@@ -488,6 +495,11 @@ export const CameraToggleButton = forwardRef<
           autoStartSignal={autoStartSignal}
           onClose={() => setShowCamera(false)}
           onStreamChange={onStreamChange}
+          className={
+            glowActive
+              ? 'ring-4 ring-green-400 ring-offset-2 transition-all duration-300'
+              : ''
+          }
         />
       )}
     </>

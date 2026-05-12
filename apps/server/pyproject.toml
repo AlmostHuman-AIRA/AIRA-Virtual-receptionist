@@ -32,6 +32,7 @@ dependencies = [
     "silero-vad",
     "deepface>=0.0.93",
     "tf-keras",
+    "mediapipe>=0.10.0",            # Face detection for presence-based activation
 ]
 
 [project.optional-dependencies]

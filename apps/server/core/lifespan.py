@@ -9,6 +9,7 @@ from models.tts_processor import KokoroTTSProcessor
 from receptionist.database import engine
 from receptionist.models import Base
 from receptionist.seed_data import seed_database
+from services.person_detection_service import warmup_mediapipe
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +33,10 @@ async def lifespan(app: FastAPI):
 
         await loop.run_in_executor(None, _init_db)
 
-        logger.info("All models initialized successfully")
+        # Pre-load MediaPipe face detection model (first inference takes ~200-500ms)
+        await loop.run_in_executor(None, warmup_mediapipe)
+
+        logger.info("All models initialised successfully")
     except Exception as e:
         logger.error(f"Error initializing models: {e}")
         raise

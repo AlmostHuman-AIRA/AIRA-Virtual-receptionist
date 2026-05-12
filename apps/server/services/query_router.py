@@ -236,13 +236,19 @@ def _commit_checkin(state: Dict[str, Any]) -> bool:
             db_purpose = state.get("purpose")
 
         # 4. Create the Reception Log
+        # ReceptionLog has no 'notes' column — merge note_content into purpose.
+        combined_purpose = db_purpose
+        if note_content:
+            combined_purpose = f"{note_content}" + (
+                f" | {db_purpose}" if db_purpose else ""
+            )
+
         log = ReceptionLog(
             visitor_id=visitor.id,
             employee_id=emp.id if emp else None,
             person_type=state.get("visitor_type", "Visitor/Guest"),
             check_in_time=datetime.utcnow(),
-            purpose=db_purpose,
-            notes=note_content,
+            purpose=combined_purpose,
         )
         db.add(log)
         db.commit()
@@ -280,9 +286,10 @@ def _commit_meeting(
     org_name: str,
     org_email: str,
 ) -> bool:
+    import threading
     from receptionist.database import schedule_meeting
 
-    # 1. Save the meeting to your local SQLite Database
+    # 1. Save the meeting to the local SQLite Database
     res = schedule_meeting(
         organizer_name=org_name,
         organizer_type="visitor",
@@ -292,20 +299,28 @@ def _commit_meeting(
         purpose=purpose,
     )
 
-    # 2. Trigger the Google Calendar API
-    if res and emp_email:
-        from services.calendar_service import send_calendar_invite
+    if res:
+        # 2. Google Calendar invite (runs in a daemon thread — it's blocking I/O)
+        if emp_email:
 
-        try:
-            meeting_dt = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
-            send_calendar_invite(
-                visitor_name=org_name,
-                employee_email=emp_email,
-                dt=meeting_dt,
-            )
-        except Exception as e:
-            logger.error("Failed to send calendar invite: %s", e)
+            def _calendar_thread():
+                try:
+                    from services.calendar_service import send_calendar_invite
 
+                    meeting_dt = datetime.strptime(
+                        f"{date_str} {time_str}", "%Y-%m-%d %H:%M"
+                    )
+                    send_calendar_invite(
+                        visitor_name=org_name,
+                        employee_email=emp_email,
+                        dt=meeting_dt,
+                    )
+                except Exception as e:
+                    logger.error("Calendar invite thread failed: %s", e)
+
+            threading.Thread(target=_calendar_thread, daemon=True).start()
+
+        # 3. Slack + email notification (email handled by Google Calendar)
         import asyncio
         from services.notification_service import send_meeting_notification
 
@@ -415,7 +430,7 @@ async def _llm_reply(
 
     known_block = "\n".join(known_info) if known_info else "- None collected yet"
 
-    prompt = f"""You are {AI_NAME}, the intelligent AI receptionist at {COMPANY_NAME}.
+    prompt = f"""You are Jarvis, the AI receptionist at Sharp Software Development India Pvt. Ltd.
 CURRENT DATE & TIME: {current_time}
 
 WHAT YOU ALREADY KNOW ABOUT THIS VISITOR:
@@ -424,16 +439,17 @@ WHAT YOU ALREADY KNOW ABOUT THIS VISITOR:
 YOUR TASK RIGHT NOW:
 {situation}
 
-RULES:
-1. NEVER start with a robotic 'Welcome to Sharp Software Development India'. 
-2. NEVER address the person as 'Visitor'. If you don't know their name, don't use a label.
-3. Keep greetings natural like a human (e.g., 'Hi there!', 'Hello! How can I help you?').
-4. If a visitor is frustrated, prioritize finishing the task over asking questions.
-5. Do not use filler words like "Certainly!", "Absolutely!", "Of course!" — just respond naturally.
-6. If the visitor is leaving (saying bye, thanks, see you), say goodbye warmly and do not ask anything else.
-7. If the visitor refuses to give their name or is getting frustrated (e.g., "Shut up", "doesn't matter"), 
-   immediately stop asking questions and provide the final instruction (like leaving the package).
-8. If the visitor already mentioned a name (e.g., "Priya"), DO NOT ask for that name again.
+CONVERSATION STYLE RULES — follow these strictly:
+1. Sound like a real, warm, professional human receptionist — not a robot or a chatbot.
+2. Keep responses SHORT. One or two sentences max unless you're reading back details.
+3. NEVER open with filler words: "Certainly!", "Absolutely!", "Of course!", "Sure!", "Great!"
+4. NEVER start with "Welcome to Sharp Software" after the very first greeting.
+5. NEVER call the person "Visitor". Use their name if you know it, otherwise say nothing.
+6. If you know their name, use it naturally once (don't repeat it every sentence).
+7. If they're leaving, give a short warm send-off and stop — don't ask anything.
+8. If they seem frustrated or are repeating themselves, skip questions and act directly.
+9. If they've already told you something (e.g. their name, who they're meeting), NEVER ask for it again.
+10. Speak in a conversational tone — contractions are fine ("I'll", "you're", "let's").
 """
     if user_query:
         prompt += f'\nTHE VISITOR JUST SAID:\n"{user_query}"\n'

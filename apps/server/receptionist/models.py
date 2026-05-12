@@ -89,7 +89,6 @@ class ReceptionLog(Base):
     check_in_time = Column(DateTime, default=datetime.utcnow)
     check_out_time = Column(DateTime, nullable=True)
     purpose = Column(String)
-    notes = Column(Text)
 
     # Relationships
     visitor = relationship("Visitor", back_populates="logs")

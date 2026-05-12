@@ -20,9 +20,16 @@ from models.tts_processor import KokoroTTSProcessor
 from services.processor_service import process_text_for_client
 from services.wake_word_service import get_wake_word_service
 from services.face_recognition_service import verify_employee_face
+from services.person_detection_service import (
+    get_person_detection_service,
+    warmup_mediapipe,
+)
 
-# Thread pool for running blocking DeepFace calls without blocking the async event loop
-_face_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="deepface")
+# Thread pool for blocking calls: DeepFace + MediaPipe (2 workers)
+_face_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="deepface")
+
+# Warm up MediaPipe face detection model in background at startup
+_face_executor.submit(warmup_mediapipe)
 
 logging.basicConfig(
     level=logging.DEBUG, format="%(asctime)s[%(levelname)s] %(name)s: %(message)s"
@@ -42,6 +49,69 @@ OWW_CHUNK_BYTES = OWW_CHUNK_SAMPLES * 2
 SILERO_WINDOW_SAMPLES = 8000
 MAX_SILENCE_MS = 1200
 FOLLOWUP_TIMEOUT_SECONDS = float(os.getenv("FOLLOWUP_TIMEOUT", "12.0"))
+
+
+# Keywords that indicate the speaker is naming their HOST, not themselves.
+# If the transcript contains these words, we must NOT trigger employee face-verify.
+_HOST_INTENT_PHRASES = re.compile(
+    r"\b(here to see|here to meet|i(?:'m| am) here for|looking for|meeting with|appointment with|see the|meet the)",
+    re.IGNORECASE,
+)
+
+# Job-title / role words — a name composed entirely of these is NOT a person name.
+_ROLE_TITLE_WORDS = {
+    "manager",
+    "director",
+    "ceo",
+    "cto",
+    "coo",
+    "cfo",
+    "president",
+    "hr",
+    "dhs",
+    "admin",
+    "head",
+    "lead",
+    "chief",
+    "officer",
+    "vp",
+    "vice",
+    "senior",
+    "junior",
+    "associate",
+    "assistant",
+    "supervisor",
+    "receptionist",
+    "secretary",
+    "coordinator",
+    "executive",
+    "intern",
+    "engineer",
+    "developer",
+    "analyst",
+    "accountant",
+    "consultant",
+}
+
+
+def _is_self_introduction(text: str) -> bool:
+    """
+    Return True only when the speaker is introducing THEMSELVES —
+    not when they are naming who they want to visit.
+    """
+    if not text:
+        return False
+    # If the sentence contains host-intent language, the person is naming a host.
+    if _HOST_INTENT_PHRASES.search(text):
+        return False
+    # Must contain a self-intro trigger phrase.
+    return bool(
+        re.search(
+            r"\b(i am|i'?m|my name is|this is|i'?m called)\b",
+            text,
+            re.IGNORECASE,
+        )
+    )
 
 
 def _extract_spoken_name(text: str) -> str | None:
@@ -72,6 +142,12 @@ def _extract_spoken_name(text: str) -> str | None:
         if 1 <= len(words) <= 2:
             return " ".join(words)
     return None
+
+
+def _is_role_only_name(name: str) -> bool:
+    """Return True if every word in the name is a job-title keyword (not a real name)."""
+    words = {w.lower().strip() for w in name.split() if w.strip()}
+    return bool(words) and words.issubset(_ROLE_TITLE_WORDS)
 
 
 def _candidate_names_from_transcript(text: str) -> list[str]:
@@ -135,7 +211,12 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
     whisper_processor = WhisperProcessor.get_instance()
     tts_processor = KokoroTTSProcessor.get_instance()
     text_queue: asyncio.Queue[str] = asyncio.Queue()
-    session_state = {"mode": "PASSIVE", "awaiting_face": False}
+    session_state = {
+        "mode": "PASSIVE",
+        "awaiting_face": False,
+        "presence_count": 0,  # consecutive frames with face detected
+        "last_presence_trigger": 0.0,  # timestamp of last camera-triggered activation
+    }
 
     try:
         await websocket.send_text(
@@ -181,6 +262,9 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                     oww_carry.clear()
                     audio_buffer.clear()
                     speech_seen = False
+                    session_state["presence_count"] = 0  # reset on every PASSIVE entry
+                    # NOTE: last_presence_trigger is intentionally NOT reset here —
+                    # the 8-second cooldown should persist across mode transitions.
                     try:
                         ww_service.model.reset()
                     except Exception:
@@ -202,6 +286,77 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                 if raw_text:
                     try:
                         msg = json.loads(raw_text)
+
+                        # ── Camera presence detection ────────────────────────────
+                        # Frontend sends a JPEG frame every 1.5 s while AIRA is passive.
+                        # MediaPipe checks if a face is looking at the camera; 2 consecutive
+                        # positives trigger the greeting (same activation path as wake word).
+                        if msg.get("type") == "presence_frame":
+                            # Only process in PASSIVE mode
+                            if session_state["mode"] != "PASSIVE":
+                                continue
+
+                            # 30-second cooldown after the last activation.
+                            # This prevents AIRA from re-greeting immediately after
+                            # a session ends while the visitor is still near the kiosk.
+                            PRESENCE_COOLDOWN = float(
+                                os.getenv("PRESENCE_COOLDOWN_SECONDS", "30.0")
+                            )
+                            if (
+                                time.time() - session_state["last_presence_trigger"]
+                                < PRESENCE_COOLDOWN
+                            ):
+                                continue
+
+                            image_b64 = msg.get("image_b64", "")
+                            if not image_b64:
+                                continue
+
+                            # Strip data-URL prefix: "data:image/jpeg;base64,XXX" → "XXX"
+                            if "," in image_b64:
+                                image_b64 = image_b64.split(",", 1)[1]
+
+                            try:
+                                image_bytes = base64.b64decode(image_b64)
+                            except Exception:
+                                continue
+
+                            # Run MediaPipe in thread pool (CPU-intensive, blocking)
+                            detection_svc = get_person_detection_service()
+                            loop = asyncio.get_event_loop()
+                            result = await loop.run_in_executor(
+                                _face_executor,
+                                lambda: detection_svc.detect_person(image_bytes),
+                            )
+
+                            if result["detected"]:
+                                session_state["presence_count"] += 1
+                                logger.info(
+                                    f"[{client_id}] Face at kiosk "
+                                    f"(count={session_state['presence_count']}, "
+                                    f"conf={result['confidence']:.2f}, "
+                                    f"ratio={result['face_ratio']:.3f})"
+                                )
+                                if session_state["presence_count"] >= 2:
+                                    logger.info(
+                                        f"[{client_id}] ✅ Person confirmed! Activating AIRA."
+                                    )
+                                    session_state["presence_count"] = 0
+                                    session_state["last_presence_trigger"] = time.time()
+                                    session_state["mode"] = "PROCESSING"
+                                    await websocket.send_text(
+                                        json.dumps({"type": "person_detected"})
+                                    )
+                                    # Reuse the exact same wake-word activation path
+                                    await text_queue.put("WAKE_WORD_TRIGGERED")
+                                    oww_carry.clear()
+                                    audio_buffer.clear()
+                                    speech_seen = False
+                            else:
+                                # No face (or too small) — reset consecutive counter
+                                session_state["presence_count"] = 0
+
+                            continue
 
                         # ── Face verification request from frontend ──────────────
                         # Triggered when the employee says their name and LLM identifies them.
@@ -358,22 +513,39 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                 )
 
                                 if text and text not in ("NOISE_DETECTED", "NO_SPEECH"):
-                                    # If we can confidently resolve an employee name from
-                                    # what was spoken, notify frontend to trigger face check.
-                                    candidates = _candidate_names_from_transcript(text)
-                                    loop = asyncio.get_event_loop()
+                                    # Only attempt employee face-verification when the speaker
+                                    # is introducing THEMSELVES as an employee.
+                                    # If they are naming who they want to VISIT (e.g. "I'm here
+                                    # to see the HR manager"), skip verification entirely and
+                                    # let the query router handle it normally.
                                     employee_name = None
-                                    for candidate in candidates:
-                                        employee_name = await loop.run_in_executor(
-                                            _face_executor,
-                                            _resolve_employee_name,
-                                            candidate,
+                                    if _is_self_introduction(text):
+                                        candidates = _candidate_names_from_transcript(
+                                            text
                                         )
-                                        if employee_name:
-                                            logger.info(
-                                                f"[{client_id}] Employee identified from candidate '{candidate}' as '{employee_name}'"
+                                        loop = asyncio.get_event_loop()
+                                        for candidate in candidates:
+                                            # Skip pure role/title strings — not real names
+                                            if _is_role_only_name(candidate):
+                                                logger.debug(
+                                                    f"[{client_id}] Skipping role-only candidate: '{candidate}'"
+                                                )
+                                                continue
+                                            resolved = await loop.run_in_executor(
+                                                _face_executor,
+                                                _resolve_employee_name,
+                                                candidate,
                                             )
-                                            break
+                                            if resolved:
+                                                employee_name = resolved
+                                                logger.info(
+                                                    f"[{client_id}] Employee identified from candidate '{candidate}' as '{employee_name}'"
+                                                )
+                                                break
+                                    else:
+                                        logger.debug(
+                                            f"[{client_id}] Skipping employee lookup — speaker is naming a host, not themselves: '{text}'"
+                                        )
 
                                     if employee_name:
                                         logger.info(

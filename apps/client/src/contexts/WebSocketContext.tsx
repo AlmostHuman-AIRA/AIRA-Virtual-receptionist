@@ -68,6 +68,8 @@ interface WebSocketContextType {
   sendFaceVerificationRequest?: (audioName: string, imageB64: string) => void;
   onVerificationResult?: (callback: (data: WebSocketMessage) => void) => void;
   onEmployeeIdentified?: (callback: (employeeName: string) => void) => void;
+  sendPresenceFrame: (imageB64: string) => void;
+  onPersonDetected: (callback: () => void) => void;
 }
 
 const WebSocketContext = createContext<WebSocketContextType | null>(null);
@@ -129,6 +131,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({
   const employeeIdentifiedCallbackRef = useRef<
     ((employeeName: string) => void) | null
   >(null);
+  const personDetectedCallbackRef = useRef<(() => void) | null>(null);
 
   const connect = useCallback(async () => {
     if (wsRef.current?.readyState === WebSocket.OPEN) return;
@@ -174,6 +177,11 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({
             typeof data.name === 'string'
           ) {
             employeeIdentifiedCallbackRef.current?.(data.name);
+          }
+
+          if (data.type === 'person_detected') {
+            console.log('[AIRA] Person detected by camera — activating AIRA');
+            personDetectedCallbackRef.current?.();
           }
 
           if (data.state) {
@@ -342,6 +350,18 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({
     []
   );
 
+  const sendPresenceFrame = useCallback((imageB64: string) => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(
+        JSON.stringify({ type: 'presence_frame', image_b64: imageB64 })
+      );
+    }
+  }, []);
+
+  const onPersonDetected = useCallback((callback: () => void) => {
+    personDetectedCallbackRef.current = callback;
+  }, []);
+
   const onAudioReceived = useCallback(
     (
       callback: (
@@ -400,7 +420,9 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({
     onServerState,
     sendFaceVerificationRequest,
     onVerificationResult,
-    onEmployeeIdentified
+    onEmployeeIdentified,
+    sendPresenceFrame,
+    onPersonDetected
   };
 
   return (

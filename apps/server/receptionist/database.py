@@ -179,7 +179,6 @@ def get_or_create_visitor(name: str, session) -> Visitor:
 def log_reception_entry(
     person_name: str,
     person_type: str,
-    notes: str = "",
     linked_visitor_id: Optional[int] = None,
     linked_employee_id: Optional[int] = None,
 ) -> int:
@@ -195,7 +194,6 @@ def log_reception_entry(
             visitor_id=linked_visitor_id,
             employee_id=linked_employee_id,
             person_type=person_type,
-            notes=notes,
             check_in_time=datetime.utcnow(),
         )
         session.add(entry)
