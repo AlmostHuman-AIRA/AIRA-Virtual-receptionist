@@ -1,4 +1,5 @@
 import logging
+import os
 import re
 import uuid
 import asyncio
@@ -171,9 +172,11 @@ def _fresh_state() -> Dict[str, Any]:
         "sched_purpose": None,
         "identity_updated": False,
         "notified_hosts": set(),
+        "all_hosts": [],  # list of all resolved host names to notify
+        "notification_channel_id": os.getenv("SLACK_NOTIFICATION_CHANNEL_ID", ""),
         "greeted": False,
         "force_admin": False,
-        "awaiting_slack_reply": False,  # ← NEW
+        "awaiting_slack_reply": False,
     }
 
 
@@ -429,19 +432,74 @@ def _merge_checkin_entities(
     state["visitor_type"] = _determine_visitor_type(
         user_query, entities.get("purpose", ""), state["visitor_type"]
     )
-    target = (
-        entities.get("employee_name")
-        or entities.get("employee_role")
-        or state.get("meeting_with_raw")
+    # ── MULTI-HOST EXTRACTION ────────────────────────────────────────────────
+    raw_targets: List[str] = []
+
+    # 1. From LLM entities (may already be a list)
+    for key in ("employee_name", "employee_role", "employee_names"):
+        val = entities.get(key)
+        if isinstance(val, list):
+            raw_targets.extend(val)
+        elif val:
+            raw_targets.append(val)
+
+    # 2. Scan raw query for "with X and Y" patterns
+    # Stops at noise words so "for me today" doesn't get captured
+    and_pattern = re.compile(
+        r"\b(?:with|meet|see)\b\s+([A-Za-z.\s]+?)(?:\s+(?:for|today|tomorrow|at|about|regarding|and\s+me)\b|$)",
+        re.IGNORECASE,
     )
-    if target and not _is_jarvis(target):
-        state["meeting_with_raw"] = target
+    m = and_pattern.search(user_query)
+    if m:
+        chunk = m.group(1).strip()
+        for part in re.split(r"\s+and\s+|\s*&\s*", chunk, flags=re.IGNORECASE):
+            part = part.strip(" .,")
+            # Skip noise words and single letters
+            if (
+                part
+                and len(part) > 1
+                and part.lower() not in {"me", "my", "us", "them", "the", "a", "an"}
+            ):
+                raw_targets.append(part)
+
+    # Deduplicate while preserving order
+    seen_keys: set = set()
+    unique_targets: List[str] = []
+    for t in raw_targets:
+        k = t.lower().strip()
+        if k and k not in seen_keys:
+            seen_keys.add(k)
+            unique_targets.append(t)
+
+    # Fallback to previously stored raw target only if nothing new found
+    if not unique_targets and state.get("meeting_with_raw"):
+        unique_targets = [state["meeting_with_raw"]]
+
+    resolved_hosts: List[str] = []
+    primary_emp = None
+    for target in unique_targets:
+        if _is_jarvis(target):
+            continue
         emp = _lookup_employee(target)
         if emp:
-            state["meeting_with_resolved"] = state["sched_employee_name"] = emp.name
-            state["sched_employee_email"] = emp.email
+            if emp.name not in resolved_hosts:
+                resolved_hosts.append(emp.name)
+            if primary_emp is None:
+                primary_emp = emp
         else:
-            state["meeting_with_resolved"] = target
+            if target not in resolved_hosts:
+                resolved_hosts.append(target)
+
+    if resolved_hosts:
+        state["meeting_with_raw"] = unique_targets[0]
+        state["meeting_with_resolved"] = resolved_hosts[0]
+        state["sched_employee_name"] = resolved_hosts[0]
+        if primary_emp:
+            state["sched_employee_email"] = primary_emp.email
+        # RESET all_hosts every time new hosts are extracted — prevents
+        # stale hosts from previous sessions bleeding in
+        state["all_hosts"] = resolved_hosts
+    # ─────────────────────────────────────────────────────────────────────────
 
     if entities.get("date"):
         state["sched_date"] = _normalize_date(str(entities["date"]))
@@ -487,32 +545,44 @@ async def _handle_directory_lookup(
     )
 
 
-async def _finalize_checkin_and_respond_UPDATED(state, query, client_id):
+async def _finalize_checkin_and_respond(state, query, client_id):
     if not state.get("visitor_name"):
         return await _llm_reply("Ask for their name politely.", state, query, client_id)
 
-    current_host = state["meeting_with_resolved"] or "Administration Team"
+    # Build the full list of hosts to notify — fall back to single host if needed
+    all_hosts: List[str] = state.get("all_hosts") or []
+    if not all_hosts:
+        fallback = state.get("meeting_with_resolved") or "Administration Team"
+        all_hosts = [fallback]
+        state["all_hosts"] = all_hosts
 
-    if current_host not in state["notified_hosts"]:
-        from services.notify_slack import send_slack_arrival
+    newly_notified: List[str] = []
+    for host in all_hosts:
+        if host not in state["notified_hosts"]:
+            send_slack_arrival(
+                host,
+                state["visitor_name"],
+                state["visitor_type"],
+                state.get("purpose", "Arrival"),
+                state["session_id"],
+            )
+            state["notified_hosts"].add(host)
+            newly_notified.append(host)
+            logger.info(
+                f"Slack notification sent to '{host}' for visitor '{state['visitor_name']}'"
+            )
 
-        send_slack_arrival(
-            current_host,
-            state["visitor_name"],
-            state["visitor_type"],
-            state.get("purpose", "Arrival"),
-            state["session_id"],
-        )
-        state["notified_hosts"].add(current_host)
-        state["awaiting_slack_reply"] = True  # ← NEW: start waiting
+    if newly_notified:
+        state["awaiting_slack_reply"] = True
         _commit_checkin(state)
 
     state["conv_state"] = "COMPLETED"
-    situation = f"Confirm {current_host} is notified."
+    host_display = " and ".join(all_hosts)
+    situation = f"Confirm {host_display} {'has' if len(all_hosts) == 1 else 'have'} been notified."
     situation += (
         " Tell them to leave the item."
         if "Delivery" in state["visitor_type"]
-        else " Ask to wait in lobby."
+        else " Ask them to wait in the lobby."
     )
     return await _llm_reply(situation, state, query, client_id)
 
@@ -572,13 +642,15 @@ async def route_query(client_id: str, user_query: str) -> str:
     entities = extracted.get("entities", {})
     _merge_checkin_entities(state, entities, user_query)
 
-    # ── CHECK FOR PENDING SLACK REPLY ──────────────────────────────────────
+    # ── CHECK FOR PENDING SLACK REPLY FROM ANY HOST ───────────────────────────
     if state.get("awaiting_slack_reply"):
-        host_name = state.get("meeting_with_resolved") or state.get(
-            "sched_employee_name"
-        )
-        if host_name:
-            slack_reply = pop_reply(host_name)  # None if not arrived yet
+        all_hosts = state.get("all_hosts") or [
+            state.get("meeting_with_resolved") or state.get("sched_employee_name")
+        ]
+        for host_name in all_hosts:
+            if not host_name:
+                continue
+            slack_reply = pop_reply(host_name)
             if slack_reply:
                 state["awaiting_slack_reply"] = False
                 situation = (
@@ -639,8 +711,6 @@ async def route_query(client_id: str, user_query: str) -> str:
     return await llm.get_response(
         client_id, user_query, company_info={"visitor_name": state["visitor_name"]}
     )
-    state["greeting_sent"] = True
-    return reply
 
 
 async def _llm_reply(
