@@ -888,6 +888,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                         "SYSTEM:Please complete face verification before continuing.",
                     )
                     and not text.startswith("SYSTEM:")
+                    and not text.startswith("SLACK_REPLY:")
                 ):
                     text_lower = text.lower()
                     if any(
@@ -901,8 +902,23 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                 manager.client_state[client_id] = "THINKING"
                 session_state["brain_is_thinking"] = True
 
+                # --- BYPASS LLM FOR SLACK REPLY SENTINELS ---
+                if text and text.startswith("SLACK_REPLY:"):
+                    # Format: SLACK_REPLY:<host_name>:<reply_text>
+                    parts = text.split(":", 2)
+                    slack_host = parts[1] if len(parts) > 1 else "your host"
+                    slack_msg = parts[2] if len(parts) > 2 else ""
+                    # Build a natural relay message via LLM
+                    relay_prompt = (
+                        f"[System Note: {slack_host} just replied via Slack with this message: "
+                        f'"{slack_msg}". Relay it naturally and helpfully to the visitor. '
+                        f"Do not greet again. Keep it short and clear.]"
+                    )
+                    reply_text = await process_text_for_client(client_id, relay_prompt)
+                    session_state["brain_is_thinking"] = False
+
                 # --- BYPASS LLM FOR SYSTEM MESSAGES ---
-                if text and text.startswith("SYSTEM:"):
+                elif text and text.startswith("SYSTEM:"):
                     reply_text = text.split("SYSTEM:", 1)[1]
                 else:
                     # --- INJECT USER IDENTITY INTO LLM PROMPT ---
@@ -976,12 +992,136 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                     # This ensures the queue is ALWAYS marked as done, even if it errors or continues
                     text_queue.task_done()
 
-        tasks = [
+        async def slack_watcher():
+            """
+            Polls for Slack replies every 3 seconds independently of session mode.
+            Survives PASSIVE/FOLLOWUP transitions — keeps watching for up to 2 minutes.
+            When a reply arrives it wakes the session back up and speaks to the visitor.
+
+            Two-strategy lookup:
+              1. pop_reply(host_name)        — exact DB name match
+              2. pop_any_channel_reply(ch)   — any reply in the channel (fallback)
+            """
+            from services.slack_reply_store import (
+                pop_reply as _pop_reply,
+                pop_any_channel_reply as _pop_channel,
+            )
+            from services.query_router import get_session_state as _get_state
+
+            POLL_INTERVAL = 3  # seconds between checks
+            MAX_WAIT = 120  # stop after 2 minutes of no reply
+
+            logger.info(f"[{client_id}] slack_watcher STARTED")
+            elapsed = 0
+
+            while elapsed < MAX_WAIT:
+                await asyncio.sleep(POLL_INTERVAL)
+                elapsed += POLL_INTERVAL
+
+                try:
+                    state = _get_state(client_id)
+                except Exception as e:
+                    logger.warning(
+                        f"[{client_id}] slack_watcher: session gone ({e}), stopping."
+                    )
+                    return
+
+                if not state.get("awaiting_slack_reply"):
+                    logger.info(
+                        f"[{client_id}] slack_watcher: awaiting_slack_reply=False, stopping."
+                    )
+                    return
+
+                host_names = state.get("all_hosts") or [
+                    state.get("meeting_with_resolved")
+                    or state.get("sched_employee_name")
+                ]
+                notification_channel = state.get("notification_channel_id", "")
+
+                logger.info(
+                    f"[{client_id}] slack_watcher poll {elapsed // POLL_INTERVAL} "
+                    f"| hosts={host_names} | channel='{notification_channel}'"
+                )
+
+                reply = None
+                reply_source = ""
+
+                # Strategy 1 — exact DB host name match
+                for host_name in host_names:
+                    if not host_name:
+                        continue
+                    reply = _pop_reply(host_name)
+                    if reply:
+                        reply_source = host_name
+                        break
+
+                # Strategy 2 — any reply in the notification channel
+                if not reply and notification_channel:
+                    reply = _pop_channel(notification_channel)
+                    if reply:
+                        reply_source = f"#{notification_channel}"
+
+                if not reply:
+                    continue
+
+                # ── Reply found — hand off to brain() for full pipeline ────────
+                # brain() handles:  THINKING → LLM → SPEAKING → LISTENING
+                # We must NOT manually set mode here — brain owns the state machine.
+                elapsed = 0
+                logger.info(
+                    f"[{client_id}] slack_watcher REPLY from '{reply_source}': {reply}"
+                )
+                state["awaiting_slack_reply"] = False
+
+                # Inject into text_queue — brain() picks it up and runs the full
+                # THINKING → SPEAKING → LISTENING cycle automatically.
+                await text_queue.put(f"SLACK_REPLY:{reply_source}:{reply}")
+
+            logger.info(
+                f"[{client_id}] slack_watcher: no reply after {MAX_WAIT}s, exiting."
+            )
+
+        # listener() and send_keepalive() drive audio I/O — exit on disconnect/timeout.
+        # brain() and slack_watcher() must outlive them to process queued replies.
+        # Strategy:
+        #   Phase 1 — run all 4 together; stop when listener or keepalive exits (disconnect/timeout)
+        #   Phase 2 — if slack reply is still pending, let brain+watcher finish together
+        io_tasks = [
             asyncio.create_task(listener()),
-            asyncio.create_task(brain()),
             asyncio.create_task(send_keepalive()),
         ]
-        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        brain_task = asyncio.create_task(brain())
+        watcher_task = asyncio.create_task(slack_watcher())
+
+        # Wait for I/O to finish (visitor left or disconnected)
+        await asyncio.wait(io_tasks, return_when=asyncio.FIRST_COMPLETED)
+
+        # Cancel I/O tasks cleanly
+        for t in io_tasks:
+            t.cancel()
+
+        # If a Slack reply is still in flight, let brain+watcher finish
+        from services.query_router import get_session_state as _qs
+
+        try:
+            _state = _qs(client_id)
+            still_waiting = _state.get("awaiting_slack_reply", False)
+        except Exception:
+            still_waiting = False
+
+        if still_waiting and not brain_task.done() and not watcher_task.done():
+            logger.info(
+                f"[{client_id}] I/O done but Slack reply pending — keeping brain+watcher alive."
+            )
+            await asyncio.wait(
+                [brain_task, watcher_task],
+                return_when=asyncio.ALL_COMPLETED,
+                timeout=120,  # hard ceiling 2 min
+            )
+
+        # Cancel whatever is left
+        brain_task.cancel()
+        watcher_task.cancel()
     finally:
         await manager.cancel_current_tasks(client_id)
         manager.disconnect(client_id)

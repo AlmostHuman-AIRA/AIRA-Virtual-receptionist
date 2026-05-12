@@ -71,14 +71,15 @@ def send_slack_arrival(
         print("DEBUG: SLACK_WEBHOOK_URL is missing!")
 
     with _notify_lock:
-        # Check for duplicates within the same session
-        if _last_notified.get(session_id) == visitor_name:
+        # Deduplicate per session + employee — prevents double-sending to the
+        # same person but allows notifying multiple hosts in one session.
+        dedup_key = f"{session_id}:{employee_name.lower().strip()}"
+        if _last_notified.get(dedup_key):
             logger.warning(
-                f"Blocking duplicate notification for {visitor_name} in session {session_id}"
+                f"Blocking duplicate notification to '{employee_name}' in session {session_id}"
             )
             return
-
-        _last_notified[session_id] = visitor_name
+        _last_notified[dedup_key] = visitor_name
 
     logger.info(f"Queuing Slack notification for {visitor_name}...")
 

@@ -1,22 +1,13 @@
 """
 slack_webhook_receiver.py
 --------------------------
-FastAPI router that receives Slack Events API callbacks.
+Receives Slack Events API callbacks.
 
-HOW IT WORKS:
-  1. In your Slack App settings, enable "Event Subscriptions".
-  2. Set Request URL to: https://<your-domain>/slack/events
-  3. Subscribe to bot event: `message.channels` (or `message.groups` for private)
-  4. When HR replies in the notification channel/thread, Slack POSTs here.
-  5. We extract the text + the user's display name → save to slack_reply_store.
+Saves every reply under:
+  1. sender display name (lowercased)  → matched if sender IS the DB employee
+  2. channel_id                        → fallback for ANY reply in the channel
 
-IMPORTANT — Slack thread context:
-  When notify_slack.py posts a message, Slack returns a `ts` (timestamp) for
-  that message. To get ONLY replies in that specific thread (not the whole channel),
-  you should store that `ts` alongside the employee_name and compare it to the
-  `thread_ts` field in incoming events. For simplicity, this implementation
-  matches on the employee mention in the text, which works fine for small teams.
-  See the TODO below if you want strict thread-level matching.
+Also exposes GET /slack/debug for live diagnosis.
 """
 
 import hashlib
@@ -28,134 +19,135 @@ import time
 import httpx
 from fastapi import APIRouter, HTTPException, Request, Response
 
-from services.slack_reply_store import save_reply
+from services.slack_reply_store import save_reply, dump_store
 
 logger = logging.getLogger(__name__)
-
 router = APIRouter()
 
 SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET", "")
-BOT_USER_ID = os.getenv("SLACK_BOT_USER_ID", "")  # Your bot's Slack user ID
+BOT_USER_ID = os.getenv("SLACK_BOT_USER_ID", "")
+SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN", "")
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SIGNATURE VERIFICATION  (security — never skip this in production)
-# ─────────────────────────────────────────────────────────────────────────────
+# channel_id → session_id mapping so we can update state["notification_channel_id"]
+# populated on first reply received in a channel
+_channel_session_map: dict[str, str] = {}
 
 
 def _verify_slack_signature(request_body: bytes, headers: dict) -> bool:
-    """Validates that the request genuinely came from Slack."""
     if not SLACK_SIGNING_SECRET:
         logger.warning("SLACK_SIGNING_SECRET not set — skipping verification (unsafe!)")
         return True
-
     timestamp = headers.get("x-slack-request-timestamp", "")
-    slack_signature = headers.get("x-slack-signature", "")
-
-    # Reject stale requests (replay attack protection)
-    if abs(time.time() - int(timestamp)) > 300:
+    slack_sig = headers.get("x-slack-signature", "")
+    try:
+        if abs(time.time() - int(timestamp)) > 300:
+            return False
+    except ValueError:
         return False
-
-    sig_basestring = f"v0:{timestamp}:{request_body.decode('utf-8')}"
-    my_signature = (
+    base = f"v0:{timestamp}:{request_body.decode('utf-8')}"
+    expected = (
         "v0="
         + hmac.new(
-            SLACK_SIGNING_SECRET.encode(),
-            sig_basestring.encode(),
-            hashlib.sha256,
+            SLACK_SIGNING_SECRET.encode(), base.encode(), hashlib.sha256
         ).hexdigest()
     )
-    return hmac.compare_digest(my_signature, slack_signature)
+    return hmac.compare_digest(expected, slack_sig)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SLACK USER → DISPLAY NAME LOOKUP
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-async def _get_slack_display_name(user_id: str, bot_token: str) -> str:
-    """
-    Calls Slack users.info to resolve a user_id like 'U0123ABC' to a real name.
-    Caches nothing here for simplicity — add an lru_cache if needed.
-    """
+async def _get_display_name(user_id: str) -> str:
+    if not SLACK_BOT_TOKEN:
+        return user_id
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.get(
                 "https://slack.com/api/users.info",
                 params={"user": user_id},
-                headers={"Authorization": f"Bearer {bot_token}"},
+                headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
                 timeout=5,
             )
             data = resp.json()
             if data.get("ok"):
-                profile = data["user"]["profile"]
-                return profile.get("display_name") or profile.get("real_name", user_id)
+                p = data["user"]["profile"]
+                name = p.get("display_name") or p.get("real_name", user_id)
+                logger.info("SLACK_RECV | resolved %s → '%s'", user_id, name)
+                return name
     except Exception as e:
-        logger.error("Could not resolve Slack user %s: %s", user_id, e)
+        logger.error("SLACK_RECV | name lookup failed for %s: %s", user_id, e)
     return user_id
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MAIN EVENT ENDPOINT
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 @router.post("/slack/events")
 async def slack_events(request: Request):
     body_bytes = await request.body()
-    headers = dict(request.headers)
 
-    # 1. Verify signature
-    if not _verify_slack_signature(body_bytes, headers):
+    if not _verify_slack_signature(body_bytes, dict(request.headers)):
         raise HTTPException(status_code=403, detail="Invalid Slack signature")
 
     payload = await request.json()
 
-    # 2. Slack URL verification handshake (one-time, when you first add the URL)
     if payload.get("type") == "url_verification":
         return {"challenge": payload["challenge"]}
 
-    # 3. Handle actual events
     event = payload.get("event", {})
-    event_type = event.get("type")
+    if event.get("type") == "message":
+        await _handle_message(event)
 
-    if event_type == "message":
-        await _handle_message_event(event)
-
-    # Slack expects a 200 quickly — always return fast
     return Response(status_code=200)
 
 
-async def _handle_message_event(event: dict):
-    """
-    Processes an incoming Slack message event and stores the reply
-    so query_router.py can pick it up.
-    """
-    # Ignore messages from the bot itself (prevents echo loops)
+async def _handle_message(event: dict):
     user_id = event.get("user", "")
-    if user_id == BOT_USER_ID:
+    channel_id = event.get("channel", "").strip()
+    text = event.get("text", "").strip()
+
+    # Ignore bot's own messages and edits/deletions
+    if user_id == BOT_USER_ID or event.get("subtype") or not text:
         return
 
-    # Ignore edited/deleted sub-types
-    if event.get("subtype"):
-        return
+    sender_name = await _get_display_name(user_id)
 
-    text: str = event.get("text", "").strip()
-    if not text:
-        return
+    logger.info(
+        "SLACK_RECV | from='%s' channel='%s' text='%s'",
+        sender_name,
+        channel_id,
+        text,
+    )
 
-    bot_token = os.getenv("SLACK_BOT_TOKEN", "")
-    sender_name = await _get_slack_display_name(user_id, bot_token)
+    # ── Save under BOTH keys ──────────────────────────────────────────────────
+    # Key 1: sender display name  (works when sender == notified employee)
+    # Key 2: channel_id           (works regardless of who replies)
+    save_reply(sender_name, text, channel_id=channel_id)
 
-    logger.info("Slack message from %s (%s): %s", sender_name, user_id, text)
 
-    # ── Store the reply keyed by the SENDER's name ───────────────────────────
-    # When your notification says "Visitor for HR Manager John", and John replies,
-    # we store the reply under John's display name. query_router looks it up
-    # using state["sched_employee_name"] or state["meeting_with_resolved"].
-    #
-    # TODO (strict thread matching): Also store the `ts` from notify_slack.py
-    # and only save replies where event["thread_ts"] == that stored ts.
-    # This eliminates false matches in busy channels.
-    # ─────────────────────────────────────────────────────────────────────────
-    save_reply(sender_name, text)
+# ── Debug endpoint ────────────────────────────────────────────────────────────
+
+
+@router.get("/slack/debug")
+async def slack_debug():
+    """
+    Open http://localhost:8000/slack/debug in your browser.
+
+    Shows what's currently in the reply store.
+    Use this to diagnose key mismatches:
+      - 'by_host' keys = sender display names (lowercased)
+      - 'by_channel' keys = Slack channel IDs
+
+    If 'by_host' has 'sannidhivk' but your DB has 'Suresh',
+    the channel fallback in slack_watcher will still relay the reply.
+    """
+    store = dump_store()
+    logger.info("SLACK_DEBUG | %s", store)
+    return {
+        "store": store,
+        "diagnosis": {
+            "by_host_keys_explanation": "Slack display names of people who replied (lowercased)",
+            "by_channel_keys_explanation": "Slack channel IDs where replies arrived",
+            "what_to_check": (
+                "If by_host keys don't match your DB employee names, "
+                "the channel fallback still works — as long as "
+                "state['notification_channel_id'] is set in the session. "
+                "If by_channel is empty, your Events API subscription may not "
+                "be receiving messages. Check your Slack App → Event Subscriptions."
+            ),
+        },
+    }
