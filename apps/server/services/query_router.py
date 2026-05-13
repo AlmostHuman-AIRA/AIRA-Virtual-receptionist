@@ -331,13 +331,53 @@ def _lookup_employee(search_term: str) -> Optional[Employee]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _finalize_meeting_and_log(state: Dict[str, Any]) -> bool:
+def _notify_host_pending(state: Dict[str, Any]) -> bool:
+    """Create the DB ReceptionLog and fire a Slack notification.
+    Does NOT book the Google Calendar — that waits for host confirmation."""
     db = SessionLocal()
     try:
         v_name = state.get("visitor_name") or "Guest"
         host_name = state["sched_employee_name"]
         emp = _lookup_employee(host_name)
         narrative = _format_descriptive_purpose(state, "SCHEDULED")
+
+        visitor = db.query(Visitor).filter(Visitor.name.ilike(v_name)).first()
+        if not visitor:
+            visitor = Visitor(name=v_name)
+            db.add(visitor)
+            db.flush()
+
+        log = ReceptionLog(
+            visitor_id=visitor.id,
+            employee_id=emp.id if emp and emp.id else None,
+            person_type=state["visitor_type"],
+            purpose=narrative,
+            check_in_time=datetime.utcnow(),
+        )
+        db.add(log)
+        db.commit()
+
+        send_slack_arrival(
+            host_name, v_name, state["visitor_type"], narrative, state["session_id"]
+        )
+        state["notified_hosts"].add(host_name)
+        state["awaiting_slack_reply"] = True
+        return True
+    except Exception as e:
+        logger.error(f"Notify-host-pending failed: {e}")
+        return False
+    finally:
+        db.close()
+
+
+def _book_calendar_event(state: Dict[str, Any]) -> bool:
+    """Book the DB meeting record and Google Calendar event.
+    Called only AFTER the host has confirmed via Slack."""
+    try:
+        v_name = state.get("visitor_name") or "Guest"
+        host_name = state["sched_employee_name"]
+        narrative = _format_descriptive_purpose(state, "SCHEDULED")
+
         mid = schedule_meeting(
             v_name,
             "Visitor",
@@ -348,24 +388,7 @@ def _finalize_meeting_and_log(state: Dict[str, Any]) -> bool:
         )
         if not mid:
             return False
-        visitor = db.query(Visitor).filter(Visitor.name.ilike(v_name)).first()
-        if not visitor:
-            visitor = Visitor(name=v_name)
-            db.add(visitor)
-            db.flush()
-        log = ReceptionLog(
-            visitor_id=visitor.id,
-            employee_id=emp.id if emp and emp.id else None,
-            person_type=state["visitor_type"],
-            purpose=narrative,
-            check_in_time=datetime.utcnow(),
-        )
-        db.add(log)
-        db.commit()
-        send_slack_arrival(
-            host_name, v_name, state["visitor_type"], narrative, state["session_id"]
-        )
-        state["notified_hosts"].add(host_name)
+
         if state.get("sched_employee_email"):
             schedule_google_meeting_background(
                 v_name,
@@ -375,10 +398,8 @@ def _finalize_meeting_and_log(state: Dict[str, Any]) -> bool:
             )
         return True
     except Exception as e:
-        logger.error(f"Finalization failed: {e}")
+        logger.error(f"Calendar booking failed: {e}")
         return False
-    finally:
-        db.close()
 
 
 def _commit_checkin(state: Dict[str, Any]) -> bool:
@@ -606,10 +627,18 @@ async def _handle_scheduling(
     if intent == "confirm" or any(
         x in query.lower() for x in ["okay", "yes", "correct", "book"]
     ):
-        if _finalize_meeting_and_log(state):
-            state["scheduling_active"], state["conv_state"] = False, State.COMPLETED
+        if _notify_host_pending(state):
+            # Keep scheduling_active — session is NOT done yet.
+            state["scheduling_active"] = True
+            state["awaiting_slack_reply"] = True
+            host = state["sched_employee_name"]
+            time = state["sched_time"]
             return await _llm_reply(
-                "Confirm booking successful.", state, query, client_id
+                f"Tell the visitor: 'I have notified {host} for {time}. "
+                f"Please give me a moment while I wait for their confirmation.'",
+                state,
+                query,
+                client_id,
             )
     return await _llm_reply(
         f"Verify meeting with {state['sched_employee_name']} at {state['sched_time']}. Proceed?",
@@ -643,22 +672,63 @@ async def route_query(client_id: str, user_query: str) -> str:
     _merge_checkin_entities(state, entities, user_query)
 
     # ── CHECK FOR PENDING SLACK REPLY FROM ANY HOST ───────────────────────────
-    if state.get("awaiting_slack_reply"):
-        all_hosts = state.get("all_hosts") or [
-            state.get("meeting_with_resolved") or state.get("sched_employee_name")
-        ]
-        for host_name in all_hosts:
-            if not host_name:
-                continue
-            slack_reply = pop_reply(host_name)
-            if slack_reply:
-                state["awaiting_slack_reply"] = False
+    if user_query.startswith("SLACK_REPLY:"):
+        parts = user_query.split(":", 2)
+        host_name = parts[1] if len(parts) > 1 else "Host"
+        slack_reply = parts[2] if len(parts) > 2 else ""
+
+        state["awaiting_slack_reply"] = False
+
+        # ── Scheduling flow: detect confirm vs counter-proposal ──
+        if state.get("scheduling_active"):
+            _CONFIRM_KEYWORDS = {
+                "yes",
+                "ok",
+                "okay",
+                "confirmed",
+                "approve",
+                "sure",
+                "sounds good",
+                "works",
+                "fine",
+                "perfect",
+                "go ahead",
+                "agreed",
+                "accept",
+            }
+            reply_lower = slack_reply.lower()
+            host_confirmed = any(kw in reply_lower for kw in _CONFIRM_KEYWORDS)
+
+            if host_confirmed:
+                _book_calendar_event(state)
+                state["scheduling_active"] = False
+                state["conv_state"] = State.COMPLETED
                 situation = (
-                    f"{host_name} replied via Slack with the following message: "
-                    f'"{slack_reply}". '
-                    f"Relay this message naturally and helpfully to the visitor."
+                    f"{host_name} confirmed the meeting. "
+                    f"Tell the visitor the meeting is confirmed "
+                    f"with {host_name} at {state.get('sched_time')}."
                 )
-                return await _llm_reply(situation, state, user_query, client_id)
+            else:
+                # Host counter-proposed — keep conversation alive
+                situation = (
+                    f'{host_name} replied via Slack: "{slack_reply}". '
+                    f"If the host proposed a new time (like 5:30), "
+                    f"ask the visitor if the new time works. "
+                    f"Otherwise relay the message naturally."
+                )
+            return await _llm_reply(
+                situation, state, "[System: Slack Reply Received]", client_id
+            )
+
+        # ── Non-scheduling flow: just relay ──
+        situation = (
+            f"{host_name} replied via Slack with the following message: "
+            f'"{slack_reply}". '
+            f"Relay this message naturally and helpfully to the visitor."
+        )
+        return await _llm_reply(
+            situation, state, "[System: Slack Reply Received]", client_id
+        )
     # ─────────────────────────────────────────────────────────────────────────
 
     # ── rest of the existing routing logic (unchanged) ────────────────────
@@ -690,15 +760,11 @@ async def route_query(client_id: str, user_query: str) -> str:
             and state["sched_employee_name"]
             and state["sched_date"]
             and state["sched_time"]
+            and not state.get("awaiting_slack_reply")
         ):
-            if _finalize_meeting_and_log(state):
-                state["scheduling_active"], state["conv_state"] = False, State.COMPLETED
-                return await _llm_reply(
-                    f"Confirmed meeting with {state['sched_employee_name']}.",
-                    state,
-                    user_query,
-                    client_id,
-                )
+            # All fields present — go through _handle_scheduling which will
+            # call _notify_host_pending and wait for the host's Slack reply.
+            pass
         return await _handle_scheduling(client_id, user_query, state, intent)
 
     if intent == "check_in" or state["meeting_with_resolved"]:

@@ -137,6 +137,8 @@ _VISITOR_KEYWORDS = (
     "onboarding",
     "new employee",
     "starting today",
+    "meeting scheduled with",
+    "scheduled a meeting",
 )
 
 
@@ -209,8 +211,9 @@ def _candidate_names_from_transcript(text: str) -> list[str]:
 
     # Strip meeting-target names FIRST, before any extraction runs.
     # Prevents "I'm here to meet Priya" from extracting "Priya" as the speaker.
+    # Line 212–217 in _candidate_names_from_transcript
     safe_text = re.sub(
-        r"\b(meet|see|looking for|appointment with|here for|visiting)\s+([A-Z][a-z.\'-]+)\b",
+        r"\b(meet|see|looking for|appointment with|here for|visiting|meeting scheduled with|scheduled.*?with)\s+([A-Z][a-z.\'-]+)\b",
         "",
         text,
         flags=re.IGNORECASE,
@@ -903,18 +906,10 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                 session_state["brain_is_thinking"] = True
 
                 # --- BYPASS LLM FOR SLACK REPLY SENTINELS ---
+                # --- BYPASS LLM FOR SLACK REPLY SENTINELS ---
                 if text and text.startswith("SLACK_REPLY:"):
-                    # Format: SLACK_REPLY:<host_name>:<reply_text>
-                    parts = text.split(":", 2)
-                    slack_host = parts[1] if len(parts) > 1 else "your host"
-                    slack_msg = parts[2] if len(parts) > 2 else ""
-                    # Build a natural relay message via LLM
-                    relay_prompt = (
-                        f"[System Note: {slack_host} just replied via Slack with this message: "
-                        f'"{slack_msg}". Relay it naturally and helpfully to the visitor. '
-                        f"Do not greet again. Keep it short and clear.]"
-                    )
-                    reply_text = await process_text_for_client(client_id, relay_prompt)
+                    # Pass the raw sentinel directly to query_router so it can handle calendar booking
+                    reply_text = await process_text_for_client(client_id, text)
                     session_state["brain_is_thinking"] = False
 
                 # --- BYPASS LLM FOR SYSTEM MESSAGES ---
@@ -995,12 +990,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
         async def slack_watcher():
             """
             Polls for Slack replies every 3 seconds independently of session mode.
-            Survives PASSIVE/FOLLOWUP transitions — keeps watching for up to 2 minutes.
-            When a reply arrives it wakes the session back up and speaks to the visitor.
-
-            Two-strategy lookup:
-              1. pop_reply(host_name)        — exact DB name match
-              2. pop_any_channel_reply(ch)   — any reply in the channel (fallback)
+            Survives PASSIVE/FOLLOWUP transitions.
             """
             from services.slack_reply_store import (
                 pop_reply as _pop_reply,
@@ -1009,14 +999,14 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
             from services.query_router import get_session_state as _get_state
 
             POLL_INTERVAL = 3  # seconds between checks
-            MAX_WAIT = 120  # stop after 2 minutes of no reply
+            MAX_WAIT = 120  # stop waiting for a specific reply after 2 minutes
 
             logger.info(f"[{client_id}] slack_watcher STARTED")
             elapsed = 0
 
-            while elapsed < MAX_WAIT:
+            # FIX: Use an infinite loop so the watcher doesn't die while the system is idle
+            while True:
                 await asyncio.sleep(POLL_INTERVAL)
-                elapsed += POLL_INTERVAL
 
                 try:
                     state = _get_state(client_id)
@@ -1024,24 +1014,28 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                     logger.warning(
                         f"[{client_id}] slack_watcher: session gone ({e}), stopping."
                     )
-                    return
+                    break
 
+                # FIX: Reset timer and continue instead of returning/stopping the task
                 if not state.get("awaiting_slack_reply"):
+                    elapsed = 0
+                    continue
+
+                elapsed += POLL_INTERVAL
+
+                if elapsed >= MAX_WAIT:
                     logger.info(
-                        f"[{client_id}] slack_watcher: awaiting_slack_reply=False, stopping."
+                        f"[{client_id}] slack_watcher: no reply after {MAX_WAIT}s, giving up on this reply."
                     )
-                    return
+                    state["awaiting_slack_reply"] = False
+                    elapsed = 0
+                    continue
 
                 host_names = state.get("all_hosts") or [
                     state.get("meeting_with_resolved")
                     or state.get("sched_employee_name")
                 ]
                 notification_channel = state.get("notification_channel_id", "")
-
-                logger.info(
-                    f"[{client_id}] slack_watcher poll {elapsed // POLL_INTERVAL} "
-                    f"| hosts={host_names} | channel='{notification_channel}'"
-                )
 
                 reply = None
                 reply_source = ""
@@ -1055,7 +1049,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                         reply_source = host_name
                         break
 
-                # Strategy 2 — any reply in the notification channel
+                # Strategy 2 — any reply in the notification channel (Handles Sannidhi replying for Priya)
                 if not reply and notification_channel:
                     reply = _pop_channel(notification_channel)
                     if reply:
@@ -1065,16 +1059,18 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                     continue
 
                 # ── Reply found — hand off to brain() for full pipeline ────────
-                # brain() handles:  THINKING → LLM → SPEAKING → LISTENING
-                # We must NOT manually set mode here — brain owns the state machine.
+                # ── Reply found — hand off to brain() for full pipeline ────────
                 elapsed = 0
                 logger.info(
                     f"[{client_id}] slack_watcher REPLY from '{reply_source}': {reply}"
                 )
-                state["awaiting_slack_reply"] = False
 
-                # Inject into text_queue — brain() picks it up and runs the full
-                # THINKING → SPEAKING → LISTENING cycle automatically.
+                # Do NOT set awaiting_slack_reply = False here. Let query_router do it.
+
+                # 1. Interrupt the microphone so the AI can speak immediately!
+                await websocket.send_json({"type": "interrupt_listening"})
+
+                # 2. Inject into text_queue — brain() picks it up and runs the full cycle.
                 await text_queue.put(f"SLACK_REPLY:{reply_source}:{reply}")
 
             logger.info(

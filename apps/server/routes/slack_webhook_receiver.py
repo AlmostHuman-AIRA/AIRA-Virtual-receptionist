@@ -80,13 +80,20 @@ async def _get_display_name(user_id: str) -> str:
 async def slack_events(request: Request):
     body_bytes = await request.body()
 
-    if not _verify_slack_signature(body_bytes, dict(request.headers)):
-        raise HTTPException(status_code=403, detail="Invalid Slack signature")
-
-    payload = await request.json()
+    # ── URL verification handshake (Slack sends this to confirm your endpoint)
+    # Must be handled BEFORE signature check — challenge requests have no signature.
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
 
     if payload.get("type") == "url_verification":
+        logger.info("SLACK_RECV | url_verification challenge received — responding.")
         return {"challenge": payload["challenge"]}
+
+    # ── Signature verification for all real events ────────────────────────────
+    if not _verify_slack_signature(body_bytes, dict(request.headers)):
+        raise HTTPException(status_code=403, detail="Invalid Slack signature")
 
     event = payload.get("event", {})
     if event.get("type") == "message":
@@ -99,7 +106,7 @@ async def _handle_message(event: dict):
     user_id = event.get("user", "")
     channel_id = event.get("channel", "").strip()
     text = event.get("text", "").strip()
-
+    thread_ts = event.get("thread_ts")  # Check if it's a thread reply
     # Ignore bot's own messages and edits/deletions
     if user_id == BOT_USER_ID or event.get("subtype") or not text:
         return

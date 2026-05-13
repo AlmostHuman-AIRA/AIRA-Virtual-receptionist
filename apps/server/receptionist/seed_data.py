@@ -116,8 +116,8 @@ def seed_database():
                 is_public=True,
             ),
             Employee(
-                name="lucy",
-                email="krutikakanchani847+shivraj@gmail.com",
+                name="Lucy",
+                email="lucy62648446@gmail.com",
                 department="Legal",
                 role="Legal Counsel",
                 location="Floor 4, Room 410",
