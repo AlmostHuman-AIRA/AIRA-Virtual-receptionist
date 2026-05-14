@@ -5,7 +5,6 @@ import numpy as np
 import openwakeword
 from openwakeword.model import Model
 
-
 logger = logging.getLogger(__name__)
 
 # OpenWakeWord expects 80 ms frames at 16 kHz = 1280 samples (2560 bytes int16 PCM).
