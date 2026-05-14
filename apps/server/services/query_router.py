@@ -16,7 +16,11 @@ from receptionist.database import (
 )
 from receptionist.models import Employee, Visitor, Meeting, ReceptionLog
 from models.groq_processor import BASE_SYSTEM_PROMPT, GroqProcessor
-from services.notify_slack import send_slack_arrival, clear_session as clear_slack_cache
+from services.notify_slack import (
+    send_slack_arrival,
+    send_slack_meeting_scheduled,
+    clear_session as clear_slack_cache,
+)
 from services.calendar_service import schedule_google_meeting_background
 
 # Logger Configuration
@@ -362,8 +366,14 @@ def _finalize_meeting_and_log(state: Dict[str, Any]) -> int:
         )
         db.add(log)
         db.commit()
-        send_slack_arrival(
-            host_name, v_name, state["visitor_type"], narrative, state["session_id"]
+        send_slack_meeting_scheduled(
+            host_name=host_name,
+            host_email=state.get("sched_employee_email", ""),
+            visitor_name=v_name,
+            date_str=state["sched_date"],
+            time_str=state["sched_time"],
+            purpose=state.get("sched_purpose") or state.get("purpose") or "Meeting",
+            session_id=state["session_id"],
         )
         state["notified_hosts"].add(host_name)
         if state.get("sched_employee_email"):

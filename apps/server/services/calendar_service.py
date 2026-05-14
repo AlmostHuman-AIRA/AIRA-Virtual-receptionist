@@ -4,6 +4,7 @@ import logging
 from pathlib import Path
 from typing import Optional
 
+import pytz
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -11,15 +12,14 @@ from googleapiclient.discovery import build
 
 logger = logging.getLogger(__name__)
 
-# If modifying these scopes, delete the file token.json.
 SCOPES = ["https://www.googleapis.com/auth/calendar.events"]
+
+IST = pytz.timezone("Asia/Kolkata")
 
 
 def get_calendar_service():
-    """Shows basic usage of the Google Calendar API."""
     creds = None
 
-    # Always resolve credentials/token under apps/server
     server_dir = Path(__file__).resolve().parent.parent
     token_path = server_dir / "token.json"
     creds_path = server_dir / "credentials.json"
@@ -32,8 +32,6 @@ def get_calendar_service():
             creds.refresh(Request())
         else:
             flow = InstalledAppFlow.from_client_secrets_file(str(creds_path), SCOPES)
-
-            # This will pop up a browser window on the user's laptop asking for Google consent.
             creds = flow.run_local_server(port=0)
 
         with open(token_path, "w") as token:
@@ -48,6 +46,7 @@ def send_calendar_invite(
 ) -> Optional[str]:
     """
     Creates a Google Calendar event and sends native email invitations.
+    dt must be a timezone-aware datetime (IST).
     """
     try:
         service = get_calendar_service()
@@ -55,7 +54,6 @@ def send_calendar_invite(
         logger.error(f"Failed to authenticate with Google Calendar: {e}")
         return None
 
-    # The event usually lasts e.g. 30 minutes
     end_dt = dt + datetime.timedelta(minutes=30)
 
     event = {
@@ -63,16 +61,15 @@ def send_calendar_invite(
         "location": "Office",
         "description": f"A meeting scheduled by Receptionist AI between {visitor_name} and you.",
         "start": {
-            "dateTime": dt.isoformat(),
-            "timeZone": "Asia/Kolkata",  # Change this timezone if needed!
+            "dateTime": dt.isoformat(),  # e.g. 2026-05-15T17:00:00+05:30
+            "timeZone": "Asia/Kolkata",
         },
         "end": {
-            "dateTime": end_dt.isoformat(),
+            "dateTime": end_dt.isoformat(),  # e.g. 2026-05-15T17:30:00+05:30
             "timeZone": "Asia/Kolkata",
         },
         "attendees": [
             {"email": employee_email},
-            # You can add more people here, like a central HR email if needed
         ],
         "reminders": {
             "useDefault": False,
@@ -84,15 +81,13 @@ def send_calendar_invite(
     }
 
     try:
-        # sendUpdates='all' natively pushes the email invite from Google Calendar
         event_result = (
             service.events()
             .insert(calendarId="primary", body=event, sendUpdates="all")
             .execute()
         )
-
         logger.info(
-            "Calendar event successfully created: %s" % (event_result.get("htmlLink"))
+            "Calendar event successfully created: %s" % event_result.get("htmlLink")
         )
         return event_result.get("htmlLink")
     except Exception as e:
@@ -107,11 +102,15 @@ def schedule_google_meeting_background(
     time_str: str,  # "HH:MM"
 ) -> None:
     """
-    Thin wrapper called by query_router._commit_meeting.
-    Parses date/time strings and delegates to send_calendar_invite.
+    Parses date/time strings, attaches IST timezone, and creates the calendar invite.
+    Using ist.localize() ensures the datetime is 2026-05-15T17:00:00+05:30
+    instead of a naive datetime that Google misinterprets as UTC.
     """
     try:
-        dt = datetime.datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
+        dt_naive = datetime.datetime.strptime(
+            f"{date_str} {time_str}", "%Y-%m-%d %H:%M"
+        )
+        dt = IST.localize(dt_naive)  # attach +05:30 — fixes the 11:30 UTC display bug
         link = send_calendar_invite(
             visitor_name=visitor_name,
             employee_email=employee_email,
