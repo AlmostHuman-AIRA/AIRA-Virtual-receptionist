@@ -104,6 +104,17 @@ _NAME_STOPWORDS = frozenset(
         "okay",
         "yeah",
         "yep",
+        "and",
+        "from",
+        "for",
+        "with",
+        "but",
+        "or",
+        "to",
+        "at",
+        "in",
+        "on",
+        "of",
     }
 )
 
@@ -139,6 +150,19 @@ _VISITOR_KEYWORDS = (
     "onboarding",
     "new employee",
     "starting today",
+    "interview",
+    "interviewing",
+    "intern",
+    "internship",
+    "delivery",
+    "courier",
+    "package",
+    "visitor",
+    "guest",
+    "joining",
+    "onboarding",
+    "appointment",
+    "visiting",
 )
 
 
@@ -169,7 +193,7 @@ def _extract_spoken_name(text: str) -> str | None:
     # Capture exactly 1 or 2 words immediately following the intro phrase.
     # Capture 1-2 words: each word is letters/hyphens/apostrophes only.
     # No dots allowed at end of token — prevents "here." being swallowed.
-    name_pattern = r"([A-Za-z'\-]+(?:\s+[A-Za-z'\-]+)?)"
+    name_pattern = r"([A-Za-z'\-]+(?:\s+(?!and\b|or\b|but\b|for\b|from\b|that\b|who\b|which\b)[A-Za-z'\-]+)?)"
 
     patterns = [
         rf"\b(?:i am|i'm)\s+{name_pattern}",
