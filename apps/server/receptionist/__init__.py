@@ -43,7 +43,6 @@ from .models import (
     Visitor,
 )
 
-
 __all__ = [
     # database helpers
     "init_db",

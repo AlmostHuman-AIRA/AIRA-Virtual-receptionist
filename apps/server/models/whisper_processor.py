@@ -60,15 +60,15 @@ class WhisperProcessor:
 
                 segments, info = self.model.transcribe(
                     audio_array,
-                    vad_filter=True,
+                    vad_filter=False,
                     vad_parameters=dict(min_silence_duration_ms=500),
-                    no_speech_threshold=0.6,
+                    no_speech_threshold=0.5,
                     log_prob_threshold=-1.0,
                     beam_size=5,
                 )
 
                 # 🔴 ADD LANGUAGE GATE HERE
-                if info.language_probability < 0.88:
+                if info.language_probability < 0.5:
                     logger.info(
                         f"Low language probability: {info.language_probability:.3f}"
                     )

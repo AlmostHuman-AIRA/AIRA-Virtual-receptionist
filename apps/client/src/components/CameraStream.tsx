@@ -75,8 +75,14 @@ const CameraStream = forwardRef<CameraStreamHandle, CameraStreamProps>(
       };
     }, [isExpanded]);
 
-    const [position, setPosition] = useState(getInitialPosition);
+    // 1. Initialize with { x: 0, y: 0 } to match the server-rendered HTML
+    const [position, setPosition] = useState({ x: 0, y: 0 });
     const [dragOffset, setDragOffset] = useState({ x: 0, y: 0 });
+
+    // 2. Add this useEffect to calculate the actual position after the component mounts
+    useEffect(() => {
+      setPosition(getInitialPosition());
+    }, [getInitialPosition]);
 
     // Adjust position when expanding/contracting
     const adjustPositionForSize = useCallback((newIsExpanded: boolean) => {
@@ -506,8 +512,8 @@ export const CameraToggleButton = forwardRef<
     cameraRef?: React.RefObject<CameraStreamHandle | null>;
   }
 >(function CameraToggleButton({ onStreamChange, cameraRef }, ref) {
-  const [showCamera, setShowCamera] = useState(false);
-  const [autoStartSignal, setAutoStartSignal] = useState(0);
+  const [showCamera, setShowCamera] = useState(true);
+  const [autoStartSignal, setAutoStartSignal] = useState(1);
 
   const ensureCameraReady = useCallback(async () => {
     if (!showCamera) {

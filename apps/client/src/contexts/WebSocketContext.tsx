@@ -78,6 +78,8 @@ interface WebSocketContextType {
     imageB64: string,
     options?: FaceVerificationRequestOptions
   ) => void;
+  sendPresenceFrame?: (imageData: string) => void;
+  onPersonDetected?: (callback: () => void) => void;
   onVerificationResult?: (callback: (data: WebSocketMessage) => void) => void;
   onEmployeeIdentified?: (callback: (employeeName: string) => void) => void;
   onRequestFaceFrame?: (callback: (data: WebSocketMessage) => void) => void;
@@ -103,7 +105,7 @@ interface WebSocketProviderProps {
 
 export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({
   children,
-  serverUrl = 'ws://127.0.0.1:8000/ws'
+  serverUrl = 'ws://localhost:8000/ws'
 }) => {
   const wsRef = useRef<WebSocket | null>(null);
   const [isConnected, setIsConnected] = useState(false);
@@ -140,6 +142,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({
   const faceVerificationResultCallbackRef = useRef<
     ((data: WebSocketMessage) => void) | null
   >(null);
+  const personDetectedCallbackRef = useRef<(() => void) | null>(null);
   const employeeIdentifiedCallbackRef = useRef<
     ((employeeName: string) => void) | null
   >(null);
@@ -185,6 +188,11 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({
           if (data.type === 'face_verification_result') {
             console.log('Received face verification result:', data);
             faceVerificationResultCallbackRef.current?.(data);
+          }
+
+          if (data.type === 'person_detected') {
+            console.log('Person detected via camera presence!');
+            personDetectedCallbackRef.current?.();
           }
 
           if (data.type === 'request_face_frame') {
@@ -370,6 +378,21 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({
     []
   );
 
+  const sendPresenceFrame = useCallback((imageData: string) => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(
+        JSON.stringify({
+          type: 'presence_frame',
+          image_b64: imageData
+        })
+      );
+    }
+  }, []);
+
+  const onPersonDetected = useCallback((callback: () => void) => {
+    personDetectedCallbackRef.current = callback;
+  }, []);
+
   const onStateChange = useCallback((callback: (state: string) => void) => {
     stateChangeCallbackRef.current = callback;
   }, []);
@@ -446,6 +469,8 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({
     onStatusChange,
     onServerState,
     sendFaceVerificationRequest,
+    sendPresenceFrame,
+    onPersonDetected,
     onVerificationResult,
     onEmployeeIdentified,
     onRequestFaceFrame,
