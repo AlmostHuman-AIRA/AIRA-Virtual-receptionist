@@ -115,6 +115,27 @@ _NAME_STOPWORDS = frozenset(
         "in",
         "on",
         "of",
+        "could",
+        "would",
+        "should",
+        "can",
+        "will",
+        "shall",
+        "may",
+        "might",
+        "must",
+        "need",
+        "want",
+        "like",
+        "please",
+        "help",
+        "hr",
+        "interview",
+        "delivery",
+        "meeting",
+        "schedule",
+        "visit",
+        "here",
     }
 )
 
@@ -224,7 +245,7 @@ def _extract_spoken_name(text: str) -> str | None:
         # If the whole utterance is very short (1-3 words)
         if 1 <= len(words) <= 3:
             name_words = [w for w in words if w.lower() not in _NAME_STOPWORDS]
-            if 1 <= len(name_words) <= 2:
+            if 1 <= len(name_words) <= 2 and all(w[0].isupper() for w in name_words):
                 return " ".join(name_words)
     return None
 
@@ -337,8 +358,12 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                         json.dumps({"type": "ping", "timestamp": time.time()})
                     )
                     await asyncio.sleep(10)
-                except Exception:
+                except WebSocketDisconnect:
                     break
+                except RuntimeError:
+                    break
+                except Exception:
+                    await asyncio.sleep(2)
 
         async def listener():
             oww_carry = bytearray()
@@ -734,6 +759,12 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
 
                 if session_state["mode"] in ("PROCESSING", "SPEAKING"):
                     continue
+                if session_state.get("face_verify_in_progress") or session_state.get(
+                    "awaiting_face"
+                ):
+                    audio_buffer.clear()
+                    speech_seen = False
+                    continue
 
                 if session_state["mode"] == "PASSIVE":
                     oww_carry.extend(raw_bytes)
@@ -1067,12 +1098,20 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                     # This ensures the queue is ALWAYS marked as done, even if it errors or continues
                     text_queue.task_done()
 
-        tasks = [
-            asyncio.create_task(listener()),
-            asyncio.create_task(brain()),
-            asyncio.create_task(send_keepalive()),
-        ]
-        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        listener_task = asyncio.create_task(listener())
+        brain_task = asyncio.create_task(brain())
+        keepalive_task = asyncio.create_task(send_keepalive())
+
+        # Only listener or brain dying should end the session
+        # Keepalive dying alone must NOT kill everything
+        await asyncio.wait(
+            [listener_task, brain_task], return_when=asyncio.FIRST_COMPLETED
+        )
+        keepalive_task.cancel()
+        try:
+            await keepalive_task
+        except asyncio.CancelledError:
+            pass
     finally:
         await manager.cancel_current_tasks(client_id)
         manager.disconnect(client_id)

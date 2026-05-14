@@ -281,7 +281,13 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({
         setIsConnected(false);
         setIsConnecting(false);
         statusChangeCallbackRef.current?.('disconnected');
-        console.log('WebSocket disconnected');
+        console.log('WebSocket disconnected — attempting reconnect in 2s...');
+        setTimeout(() => {
+          if (!wsRef.current || wsRef.current.readyState === WebSocket.CLOSED) {
+            console.log('Reconnecting...');
+            void connect();
+          }
+        }, 2000);
       };
     } catch {
       setIsConnecting(false);

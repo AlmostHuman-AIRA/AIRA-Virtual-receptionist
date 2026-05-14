@@ -1,13 +1,3 @@
-"""
-database.py
------------
-Normalized SQLAlchemy-backed database layer for the receptionist application.
-
-* Uses `office.db` (SQLite) stored alongside this module.
-* Utilizes relational models (Foreign Keys, strict Entities vs Events).
-* Includes robust date/time natural language parsing helpers.
-"""
-
 from __future__ import annotations
 
 import difflib
@@ -53,15 +43,24 @@ logger = logging.getLogger(__name__)
 # Schema initialisation
 # ──────────────────────────────────────────────────────────────────────────────
 
+# ADD THIS
 ALL_SLOTS_1H: List[str] = [
     "09:00",
+    "09:30",
     "10:00",
+    "10:30",
     "11:00",
+    "11:30",
     "12:00",
+    "12:30",
     "13:00",
+    "13:30",
     "14:00",
+    "14:30",
     "15:00",
+    "15:30",
     "16:00",
+    "16:30",
     "17:00",
 ]
 
@@ -634,7 +633,12 @@ def schedule_meeting(
             .first()
         )
         if existing:
-            return existing.id
+            logger.warning(
+                "Slot %s is already booked for employee '%s'.",
+                scheduled_dt,
+                employee_name,
+            )
+            return -1  # -1 = slot conflict; caller must handle this separately
 
         new_meeting = Meeting(
             host_employee_id=emp.id,
