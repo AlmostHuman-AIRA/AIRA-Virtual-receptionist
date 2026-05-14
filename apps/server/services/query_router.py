@@ -492,6 +492,11 @@ async def _finalize_checkin_and_respond(
 ) -> str:
     if not state.get("visitor_name"):
         return await _llm_reply("Ask for their name politely.", state, query, client_id)
+    if not state.get("meeting_with_resolved"):
+        semantic_host = _lookup_employee(state.get("purpose", "") + " " + query)
+        if semantic_host and semantic_host.name != "Administration Team":
+            state["meeting_with_resolved"] = semantic_host.name
+
     current_host = state["meeting_with_resolved"] or "Administration Team"
     if current_host not in state["notified_hosts"]:
         send_slack_arrival(
