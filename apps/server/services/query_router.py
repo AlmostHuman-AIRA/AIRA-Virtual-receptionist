@@ -328,7 +328,7 @@ def _lookup_employee(search_term: str) -> Optional[Employee]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _finalize_meeting_and_log(state: Dict[str, Any]) -> bool:
+def _finalize_meeting_and_log(state: Dict[str, Any]) -> int:
     db = SessionLocal()
     try:
         v_name = state.get("visitor_name") or "Guest"
@@ -343,8 +343,11 @@ def _finalize_meeting_and_log(state: Dict[str, Any]) -> bool:
             state["sched_time"],
             narrative,
         )
+        if mid == -1:
+            return -1  # conflict — slot already booked
         if not mid:
-            return False
+            return False  # other failure (employee not found, bad datetime, etc.)
+
         visitor = db.query(Visitor).filter(Visitor.name.ilike(v_name)).first()
         if not visitor:
             visitor = Visitor(name=v_name)
@@ -490,6 +493,11 @@ async def _handle_directory_lookup(
 async def _finalize_checkin_and_respond(
     state: Dict[str, Any], query: str, client_id: str
 ) -> str:
+    logger.info(
+        f"[finalize] visitor={state.get('visitor_name')} "
+        f"host={state.get('meeting_with_resolved')} "
+        f"type={state.get('visitor_type')}"
+    )
     if not state.get("visitor_name"):
         return await _llm_reply("Ask for their name politely.", state, query, client_id)
     if not state.get("meeting_with_resolved"):
@@ -537,7 +545,20 @@ async def _handle_scheduling(
     if intent == "confirm" or any(
         x in query.lower() for x in ["okay", "yes", "correct", "book"]
     ):
-        if _finalize_meeting_and_log(state):
+        result = _finalize_meeting_and_log(state)
+        if result == -1:
+            alts = get_available_slots(
+                state["sched_employee_name"], state["sched_date"]
+            )
+            alt_str = ", ".join(alts[:3]) if alts else "no slots available that day"
+            state["sched_time"] = None  # clear so the scheduler asks again
+            return await _llm_reply(
+                f"That slot is already booked. Suggest these alternatives: {alt_str}. Ask which they prefer.",
+                state,
+                query,
+                client_id,
+            )
+        if result:
             state["scheduling_active"], state["conv_state"] = False, State.COMPLETED
             return await _llm_reply(
                 "Confirm booking successful.", state, query, client_id
@@ -562,23 +583,52 @@ async def route_query(client_id: str, user_query: str) -> str:
     extracted = await llm.extract_intent_and_entities(user_query)
     intent, entities = extracted.get("intent", "general"), extracted.get("entities", {})
     _merge_checkin_entities(state, entities, user_query)
+
+    if not state.get("meeting_with_resolved"):
+        role_match = _lookup_employee(user_query)
+        if role_match and role_match.name != "Administration Team":
+            state["meeting_with_resolved"] = role_match.name
+            state["sched_employee_name"] = role_match.name
+            state["sched_employee_email"] = role_match.email
+
     if any(
         x in query_low for x in ["don't know", "do not know", "anyone", "notify admin"]
     ):
         state["force_admin"] = True
         state["meeting_with_resolved"] = "Administration Team"
+
     if any(w in query_low for w in ["thank you", "thanks", "bye", "goodbye"]):
-        reply = await llm.get_raw_response(
-            f"Warm closing for: {user_query}", client_id=client_id
+        reply = await _llm_reply(
+            "Give a single warm farewell sentence. Use the visitor's name if you know it. Do NOT list multiple options.",
+            state,
+            user_query,
+            client_id,
         )
         clear_session_state(client_id)
         return reply
+
     if any(x in query_low for x in ["free time", "available", "is he free"]):
         return await _handle_availability_check(state, user_query, client_id)
-    if intent == "employee_lookup" or any(
-        x in query_low for x in ["who is", "director", "ceo"]
-    ):
+
+    _LOOKUP_ONLY_PHRASES = ["who is", "where is", "which floor", "what department"]
+    _NOTIFY_PHRASES = [
+        "notify",
+        "tell",
+        "inform",
+        "waiting",
+        "let him know",
+        "let her know",
+        "please notify",
+        "i'm here",
+        "i am here",
+    ]
+    is_notify_intent = any(w in query_low for w in _NOTIFY_PHRASES)
+    is_lookup_intent = intent == "employee_lookup" or any(
+        x in query_low for x in _LOOKUP_ONLY_PHRASES
+    )
+    if is_lookup_intent and not is_notify_intent:
         return await _handle_directory_lookup(state, user_query, client_id)
+
     if intent == "schedule_meeting" or state["scheduling_active"]:
         state["scheduling_active"] = True
         if (
@@ -587,7 +637,20 @@ async def route_query(client_id: str, user_query: str) -> str:
             and state["sched_date"]
             and state["sched_time"]
         ):
-            if _finalize_meeting_and_log(state):
+            result = _finalize_meeting_and_log(state)
+            if result == -1:
+                alts = get_available_slots(
+                    state["sched_employee_name"], state["sched_date"]
+                )
+                alt_str = ", ".join(alts[:3]) if alts else "no slots available that day"
+                state["sched_time"] = None  # clear so the scheduler asks again
+                return await _llm_reply(
+                    f"That slot is already booked. Suggest these alternatives: {alt_str}. Ask which they prefer.",
+                    state,
+                    user_query,
+                    client_id,
+                )
+            if result:
                 state["scheduling_active"], state["conv_state"] = False, State.COMPLETED
                 return await _llm_reply(
                     f"Confirmed meeting with {state['sched_employee_name']}.",

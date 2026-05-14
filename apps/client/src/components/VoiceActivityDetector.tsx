@@ -91,6 +91,7 @@ const Dot: React.FC<{ active: boolean; color: string; label: string }> = ({
 
 const VoiceActivityDetector: React.FC = () => {
   const [backendState, setBackendState] = useState<BackendState>('passive');
+  const [connectionLost, setConnectionLost] = useState(false);
   const [micActive, setMicActive] = useState(false);
   const [micError, setMicError] = useState<string | null>(null);
 
@@ -111,6 +112,9 @@ const VoiceActivityDetector: React.FC = () => {
   useEffect(() => {
     if (!isConnected) {
       setBackendState('passive');
+      setConnectionLost(true);
+    } else {
+      setConnectionLost(false);
     }
   }, [isConnected]);
 
@@ -241,6 +245,14 @@ const VoiceActivityDetector: React.FC = () => {
 
       <CardContent className="flex flex-col items-center gap-6">
         {/* Main status orb */}
+
+        {connectionLost && (
+          <Alert className="w-full border-yellow-300 bg-yellow-50">
+            <AlertDescription className="text-center text-sm text-yellow-700">
+              Connection lost — reconnecting...
+            </AlertDescription>
+          </Alert>
+        )}
         <StatusOrb state={backendState} />
 
         {/* Indicator dots row */}
