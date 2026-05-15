@@ -12,7 +12,6 @@ import {
 import { useFaceVerification } from '@/hooks/useFaceVerification';
 import { usePresenceDetection } from '@/hooks/usePresenceDetection';
 import { useWebSocketContext } from '@/contexts/WebSocketContext';
-import { useState, useEffect } from 'react';
 
 export default function Home() {
   const cameraRef = useRef<CameraStreamHandle | null>(null);
@@ -25,14 +24,7 @@ export default function Home() {
     }
   );
 
-  const { onServerState } = useWebSocketContext();
-  const [serverState, setServerState] = useState('passive');
-
-  useEffect(() => {
-    if (onServerState) {
-      onServerState(setServerState);
-    }
-  }, [onServerState]);
+  const { serverState } = useWebSocketContext();
 
   const { personDetected } = usePresenceDetection(cameraRef, serverState);
 
