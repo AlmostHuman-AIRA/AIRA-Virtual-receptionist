@@ -255,9 +255,10 @@ def _candidate_names_from_transcript(text: str) -> list[str]:
         return []
 
     # Strip meeting-target names FIRST, before any extraction runs.
-    # Prevents "I'm here to meet Priya" from extracting "Priya" as the speaker.
+    # Prevents "I'm here to meet Priya" or "schedule a meeting with Lucy"
+    # from extracting the HOST name as the speaker's name.
     safe_text = re.sub(
-        r"\b(meet|see|looking for|appointment with|here for|visiting)\s+([A-Z][a-z.\'-]+)\b",
+        r"\b(?:meet|see|looking for|appointment with|meeting with|schedule\s+\w+\s+with|here for|here to meet|visiting|talk to|speak to|speak with)\s+([A-Z][a-z.\'-]+)\b",
         "",
         text,
         flags=re.IGNORECASE,
@@ -906,12 +907,35 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                             loop = asyncio.get_event_loop()
 
                                             if detected_person_type == "visitor":
-                                                if candidates:
-                                                    employee_name = candidates[0]
+                                                # For visitors, only use the extracted name if it came
+                                                # from an explicit self-introduction phrase
+                                                # ("I am X", "my name is X", etc.).
+                                                # The capitalized-word fallback can pick up the host
+                                                # name ("schedule a meeting with Lucy" → "Lucy"),
+                                                # so we re-run the strict extractor on safe_text only.
+                                                safe_text_for_name = re.sub(
+                                                    r"\b(?:meet|see|looking for|appointment with|meeting with|schedule\s+\w+\s+with|here for|here to meet|visiting|talk to|speak to|speak with)\s+([A-Z][a-z.\'-]+)\b",
+                                                    "",
+                                                    text,
+                                                    flags=re.IGNORECASE,
+                                                )
+                                                strict_name = _extract_spoken_name(
+                                                    safe_text_for_name
+                                                )
+                                                if strict_name:
+                                                    employee_name = strict_name
                                                     logger.info(
                                                         f"[{client_id}] Visitor detected. "
                                                         f"Speaker name extracted: '{employee_name}' "
                                                         f"(skipping DB lookup)"
+                                                    )
+                                                else:
+                                                    # No explicit self-intro found — don't guess a name.
+                                                    # The LLM will ask for it naturally.
+                                                    employee_name = None
+                                                    logger.info(
+                                                        f"[{client_id}] Visitor detected but no explicit "
+                                                        f"self-introduction found — skipping name extraction."
                                                     )
                                             else:
                                                 for candidate in candidates:

@@ -3,7 +3,7 @@ import logging
 import os
 import re
 import itertools
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -31,43 +31,64 @@ RULES:
 3. NO FILLER: Avoid 'Certainly!', 'I understand', or 'Let me help you with that'.
 4. CONTEXT: If you know the visitor's name, use it.
 """
+
+
 # Detailed NLU Extraction Prompt
-EXTRACT_SYSTEM = """You are an information extraction engine. Return ONLY valid JSON.
-{
+# Change EXTRACT_SYSTEM from a plain string to a function
+def _build_extract_system() -> str:
+    today = datetime.now()
+    today_str = today.strftime("%A, %Y-%m-%d")
+    this_friday = today + timedelta(days=(4 - today.weekday() + 7) % 7 or 7)
+    next_friday = this_friday + timedelta(days=7)
+    return f"""You are an information extraction engine. Return ONLY valid JSON.
+{{
   "intent": "check_in" | "schedule_meeting" | "employee_lookup" | "confirm" | "general",
-  "entities": {
-    "visitor_name": string, "employee_name": string, "date": string, "time": string, "purpose": string, "visitor_type": string, "email": string
-  }
-}
+  "entities": {{
+    "visitor_name": string, "employee_name": string, "date": "YYYY-MM-DD or null",
+    "time": "HH:MM (24h) or null", "purpose": string, "visitor_type": string, "email": string
+  }}
+}}
+
+TODAY IS: {today_str}
+Resolve ALL relative dates to YYYY-MM-DD. Never return natural language in the date field.
+- "today"        → {today.strftime("%Y-%m-%d")}
+- "tomorrow"     → {(today + timedelta(days=1)).strftime("%Y-%m-%d")}
+- "this friday"  → {this_friday.strftime("%Y-%m-%d")}
+- "next friday"  → {next_friday.strftime("%Y-%m-%d")} (always the Friday of the FOLLOWING week, never this week)
+Apply the same logic for other weekday names (this monday, next tuesday, etc).
 
 INTENT CLASSIFICATION RULES:
-- "check_in" : Arriving at the office NOW to start work, see someone, or drop off a package.
-- "schedule_meeting" : Wants to BOOK or SET UP a FUTURE appointment.
+- "check_in"        : Arriving at the office NOW to start work, see someone, or drop off a package.
+- "schedule_meeting": Wants to BOOK or SET UP a FUTURE appointment.
 - "employee_lookup" : Asking for availability or location of a colleague/department.
-- "confirm" : Saying yes, correct, or "schedule it".
-- "general" : Greetings or small talk.
+- "confirm"         : Saying yes, correct, or "schedule it".
+- "general"         : Greetings or small talk.
 
 VISITOR TYPE CATEGORIES (MUST BE ONE OF THESE):
-- "Employee" : Staff members, managers, or anyone who says "I work here".
-- "Delivery" : Amazon, Flipkart, DHL, or general package couriers.
-- "Food Delivery" : Swiggy, Zomato, or food orders.
-- "Interviewee" : Job candidates or HR interviews.
-- "Intern" : Students or trainees starting their internship or reporting to HR.
+- "Employee"          : Staff members, managers, or anyone who says "I work here".
+- "Delivery"          : Amazon, Flipkart, DHL, or general package couriers.
+- "Food Delivery"     : Swiggy, Zomato, or food orders.
+- "Interviewee"       : Job candidates or HR interviews.
+- "Intern"            : Students or trainees starting their internship or reporting to HR.
 - "Contractor/Vendor" : Maintenance, electrician, plumber, or service staff.
-- "Client" : External business customers or demos.
-- "Visitor/Guest" : General personal or business meetings.
+- "Client"            : External business customers or demos.
+- "Visitor/Guest"     : General personal or business meetings.
 
 FEW-SHOT EXAMPLES:
 
 Input: "I am Priya and I am an employee here."
-Output: {"intent": "check_in", "entities": {"visitor_name": "Priya", "employee_name": null, "role": "Employee", "date": null, "time": null, "purpose": "reporting for work", "visitor_type": "Employee"}}
+Output: {{"intent": "check_in", "entities": {{"visitor_name": "Priya", "employee_name": null, "date": null, "time": null, "purpose": "reporting for work", "visitor_type": "Employee", "email": null}}}}
 
 Input: "I'm from Amazon to drop off a parcel for Virat."
-Output: {"intent": "check_in", "entities": {"visitor_name": "Amazon", "employee_name": "Virat", "role": null, "date": null, "time": null, "purpose": "parcel delivery", "visitor_type": "Delivery"}}
+Output: {{"intent": "check_in", "entities": {{"visitor_name": "Amazon", "employee_name": "Virat", "date": null, "time": null, "purpose": "parcel delivery", "visitor_type": "Delivery", "email": null}}}}
 
 Input: "Yes, please schedule that for 5 p.m. today."
-Output: {"intent": "confirm", "entities": {"visitor_name": null, "employee_name": null, "role": null, "date": "today", "time": "5:00 PM", "purpose": null, "visitor_type": null}}
+Output: {{"intent": "confirm", "entities": {{"visitor_name": null, "employee_name": null, "date": "{today.strftime('%Y-%m-%d')}", "time": "17:00", "purpose": null, "visitor_type": null, "email": null}}}}
+
+Input: "Next Friday at 11 a.m."
+Output: {{"intent": "confirm", "entities": {{"visitor_name": null, "employee_name": null, "date": "{next_friday.strftime('%Y-%m-%d')}", "time": "11:00", "purpose": null, "visitor_type": null, "email": null}}}}
 """
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ENV / API KEY HELPERS (PRESERVED)
@@ -305,7 +326,7 @@ class GroqProcessor:
         """Extracts structured data from user utterances using NLU engine."""
         try:
             messages = [
-                {"role": "system", "content": EXTRACT_SYSTEM},
+                {"role": "system", "content": _build_extract_system()},
                 {"role": "user", "content": user_query.strip()},
             ]
 
