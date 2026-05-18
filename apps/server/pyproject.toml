@@ -31,14 +31,12 @@ dependencies = [
     "openwakeword",
     "silero-vad",
     "deepface>=0.0.93",
-    "tf-keras",
-    "deepface>=0.0.93",
-    "tf-keras",                   # Required for newer DeepFace/TF compatibility
-    "python-dotenv",              # <--- ADDED: For load_dotenv()
-    "mtcnn",                      # <--- ADDED: Required for FACE_VERIFY_DETECTOR=mtcnn
-    "tensorflow-cpu",             # <--- ADDED: Forces CPU-only to avoid GPU/CUDA headaches
-    "opencv-python-headless",     # <--- ADDED: Safer for server environments (avoids libGL errors)
-
+    "tf-keras",                       # Required for newer DeepFace/TF compatibility
+    "python-dotenv",                  # For load_dotenv()
+    "mtcnn",                          # Required for FACE_VERIFY_DETECTOR=mtcnn
+    "tensorflow==2.15.1",             # 2.15.1 = last version with win_amd64 wheel for tensorflow-io-gcs-filesystem
+    "opencv-python-headless",         # Safer for server environments (avoids libGL errors)
+    "mediapipe==0.10.14",             # Face detection for presence-based activation
 ]
 
 [project.optional-dependencies]
@@ -54,6 +52,16 @@ extra-index-url = [
 ]
 index-strategy = "unsafe-best-match"
 
+# Hard-exclude tensorflow-io-gcs-filesystem on Windows.
+# It has no win_amd64 wheels and tensorflow 2.16+ doesn't need it anyway.
+override-dependencies = [
+    "tensorflow-io-gcs-filesystem; sys_platform == 'linux'",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [tool.hatch.metadata]
 allow-direct-references = true
 
@@ -62,7 +70,3 @@ include = [
     "*.py",
     "README.md",
 ]
-
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"

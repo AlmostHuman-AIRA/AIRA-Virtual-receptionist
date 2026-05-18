@@ -36,7 +36,12 @@ async def lifespan(app: FastAPI):
         logger.info(
             "Diagnostic capture cleanup completed. Deleted=%s", deleted_captures
         )
+        # Cleanup old visitors (and their photos) from disk and DB
+        from receptionist.cleanup_old_visitors import purge_old_visitors
 
+        deleted_visitors = await loop.run_in_executor(None, purge_old_visitors)
+        logger.info("Visitor retention cleanup completed. Deleted=%s", deleted_visitors)
+        # ────────────────────────────────────────────────────────────
         logger.info("All models initialized successfully")
     except Exception as e:
         logger.error(f"Error initializing models: {e}")

@@ -22,15 +22,17 @@ from services.wake_word_service import get_wake_word_service
 
 # --- Other imports remain the same ---
 from services.face_recognition_service import verify_person_face, warmup_deepface
+from services.person_detection_service import (
+    get_person_detection_service,
+    warmup_mediapipe,
+)
 
-# Thread pool for running blocking DeepFace calls without blocking the async event loop.
-# 2 workers: one for _resolve_employee_name (DB fuzzy lookup) and one for verify_person_face
-# (DeepFace). With only 1 worker, a DB lookup submitted first can starve the face verification
-# submitted immediately after, causing the session to time out before the camera frame arrives.
-_face_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="deepface")
+# Thread pool for running blocking DeepFace and MediaPipe calls without blocking the async event loop.
+_face_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="deepface")
 
 # Trigger model warmup immediately when the server file is loaded
 _face_executor.submit(warmup_deepface)
+_face_executor.submit(warmup_mediapipe)
 
 logging.basicConfig(
     # ... rest of your code ...
@@ -102,6 +104,38 @@ _NAME_STOPWORDS = frozenset(
         "okay",
         "yeah",
         "yep",
+        "and",
+        "from",
+        "for",
+        "with",
+        "but",
+        "or",
+        "to",
+        "at",
+        "in",
+        "on",
+        "of",
+        "could",
+        "would",
+        "should",
+        "can",
+        "will",
+        "shall",
+        "may",
+        "might",
+        "must",
+        "need",
+        "want",
+        "like",
+        "please",
+        "help",
+        "hr",
+        "interview",
+        "delivery",
+        "meeting",
+        "schedule",
+        "visit",
+        "here",
     }
 )
 
@@ -137,8 +171,19 @@ _VISITOR_KEYWORDS = (
     "onboarding",
     "new employee",
     "starting today",
-    "meeting scheduled with",
-    "scheduled a meeting",
+    "interview",
+    "interviewing",
+    "intern",
+    "internship",
+    "delivery",
+    "courier",
+    "package",
+    "visitor",
+    "guest",
+    "joining",
+    "onboarding",
+    "appointment",
+    "visiting",
 )
 
 
@@ -169,7 +214,7 @@ def _extract_spoken_name(text: str) -> str | None:
     # Capture exactly 1 or 2 words immediately following the intro phrase.
     # Capture 1-2 words: each word is letters/hyphens/apostrophes only.
     # No dots allowed at end of token — prevents "here." being swallowed.
-    name_pattern = r"([A-Za-z'\-]+(?:\s+[A-Za-z'\-]+)?)"
+    name_pattern = r"([A-Za-z'\-]+(?:\s+(?!and\b|or\b|but\b|for\b|from\b|that\b|who\b|which\b)[A-Za-z'\-]+)?)"
 
     patterns = [
         rf"\b(?:i am|i'm)\s+{name_pattern}",
@@ -200,7 +245,7 @@ def _extract_spoken_name(text: str) -> str | None:
         # If the whole utterance is very short (1-3 words)
         if 1 <= len(words) <= 3:
             name_words = [w for w in words if w.lower() not in _NAME_STOPWORDS]
-            if 1 <= len(name_words) <= 2:
+            if 1 <= len(name_words) <= 2 and all(w[0].isupper() for w in name_words):
                 return " ".join(name_words)
     return None
 
@@ -296,6 +341,8 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
         "conversation_complete": False,
         "visitor_captured": False,  # ← ADD
         "brain_is_thinking": False,  # ← ADD
+        "presence_count": 0,
+        "last_presence_trigger": 0.0,
     }
 
     try:
@@ -312,8 +359,12 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                         json.dumps({"type": "ping", "timestamp": time.time()})
                     )
                     await asyncio.sleep(10)
-                except Exception:
+                except WebSocketDisconnect:
                     break
+                except RuntimeError:
+                    break
+                except Exception:
+                    await asyncio.sleep(2)
 
         async def listener():
             oww_carry = bytearray()
@@ -355,6 +406,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                     session_state["person_type"] = "employee"
                     session_state["mismatch_strikes"] = 0
                     session_state["conversation_complete"] = False
+                    session_state["presence_count"] = 0
 
                     try:
                         ww_service.model.reset()
@@ -381,6 +433,68 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                 if raw_text:
                     try:
                         msg = json.loads(raw_text)
+
+                        if msg.get("type") == "presence_frame":
+                            if session_state["mode"] != "PASSIVE":
+                                continue
+
+                            # Cooldown: skip if we triggered recently (prevent rapid re-activation)
+                            PRESENCE_FRAME_COOLDOWN = float(
+                                os.getenv("PRESENCE_FRAME_COOLDOWN", "5.0")
+                            )
+                            if (
+                                time.time() - session_state["last_presence_trigger"]
+                                < PRESENCE_FRAME_COOLDOWN
+                            ):
+                                continue
+
+                            image_b64 = msg.get("image_b64", "")
+                            if not image_b64:
+                                continue
+
+                            # Run MediaPipe detection in thread pool (non-blocking)
+                            detection_service = get_person_detection_service()
+                            loop = asyncio.get_event_loop()
+                            result = await loop.run_in_executor(
+                                _face_executor,
+                                lambda: detection_service.detect_person(image_b64),
+                            )
+
+                            if result["detected"]:
+                                session_state["presence_count"] += 1
+                                logger.info(
+                                    f"[{client_id}] Person detected (count={session_state['presence_count']}, "
+                                    f"confidence={result['confidence']:.2f}, face_ratio={result['face_ratio']:.3f})"
+                                )
+
+                                PRESENCE_CONFIRM_FRAMES = int(
+                                    os.getenv("PRESENCE_CONFIRM_FRAMES", "2")
+                                )
+                                if (
+                                    session_state["presence_count"]
+                                    >= PRESENCE_CONFIRM_FRAMES
+                                ):
+                                    logger.info(
+                                        f"[{client_id}] ✅ Person confirmed! Activating AIRA."
+                                    )
+                                    session_state["presence_count"] = 0
+                                    session_state["last_presence_trigger"] = time.time()
+                                    session_state["mode"] = "PROCESSING"
+
+                                    # Notify frontend
+                                    await websocket.send_text(
+                                        json.dumps({"type": "person_detected"})
+                                    )
+
+                                    # Reuse existing wake-up flow
+                                    await text_queue.put("WAKE_WORD_TRIGGERED")
+                                    oww_carry.clear()
+                                    audio_buffer.clear()
+                                    speech_seen = False
+                            else:
+                                # No face → reset consecutive count
+                                session_state["presence_count"] = 0
+                            continue
 
                         # ── Face verification request from frontend ──────────────
                         # Triggered when the employee says their name and LLM identifies them.
@@ -645,6 +759,12 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                     )
 
                 if session_state["mode"] in ("PROCESSING", "SPEAKING"):
+                    continue
+                if session_state.get("face_verify_in_progress") or session_state.get(
+                    "awaiting_face"
+                ):
+                    audio_buffer.clear()
+                    speech_seen = False
                     continue
 
                 if session_state["mode"] == "PASSIVE":
