@@ -239,36 +239,58 @@ def _format_descriptive_purpose(
 
 
 def _normalize_date(raw: str) -> Optional[str]:
+    """Validates LLM-returned dates and catches any natural language that slipped through."""
     if not raw:
         return None
-    s = str(raw).lower()
+    s = str(raw).strip()
+
+    # Happy path — LLM already resolved to YYYY-MM-DD
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", s):
+        return s
+
+    # Safety net — LLM returned natural language anyway
     today = datetime.now().date()
+    s_low = s.lower()
+
+    if "today" in s_low:
+        return today.strftime("%Y-%m-%d")
+    if "tomorrow" in s_low:
+        return (today + timedelta(days=1)).strftime("%Y-%m-%d")
+
+    weekday_map = {
+        "monday": 0,
+        "tuesday": 1,
+        "wednesday": 2,
+        "thursday": 3,
+        "friday": 4,
+        "saturday": 5,
+        "sunday": 6,
+    }
+
+    # "next <weekday>" — always the FOLLOWING week's occurrence
     match = re.search(
-        r"next\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)", s
+        r"next\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)", s_low
     )
     if match:
-        weekday_map = {
-            "mon": 0,
-            "tue": 1,
-            "wed": 2,
-            "thu": 3,
-            "fri": 4,
-            "sat": 5,
-            "sun": 6,
-        }
-        target_day = weekday_map[match.group(1)[:3]]
+        target_day = weekday_map[match.group(1)]
+        days_ahead = (target_day - today.weekday() + 7) % 7
+        if days_ahead == 0:
+            days_ahead = 7
+        days_ahead += 7  # "next" always skips to the following week
+        return (today + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
+
+    # "this <weekday>" — the coming occurrence within this week
+    match = re.search(
+        r"this\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)", s_low
+    )
+    if match:
+        target_day = weekday_map[match.group(1)]
         days_ahead = (target_day - today.weekday() + 7) % 7
         if days_ahead == 0:
             days_ahead = 7
         return (today + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
-    if "today" in s:
-        return today.strftime("%Y-%m-%d")
-    if "tomorrow" in s:
-        return (today + timedelta(days=1)).strftime("%Y-%m-%d")
-    try:
-        return datetime.strptime(s, "%Y-%m-%d").date().strftime("%Y-%m-%d")
-    except:
-        return None
+
+    return None  # couldn't parse — router will re-ask for the date
 
 
 def _normalize_time(raw: str) -> Optional[str]:
@@ -428,20 +450,43 @@ def _merge_checkin_entities(
     state: Dict[str, Any], entities: Dict[str, Any], user_query: str
 ) -> None:
     query_low = user_query.lower()
+
+    # ── Visitor (speaker) name ────────────────────────────────────────────────
     v_name = entities.get("visitor_name")
     if v_name and not _is_jarvis(v_name):
         new_name = v_name.capitalize()
-        emp_record = get_employee_by_name(new_name)
-        if emp_record or "i am an employee" in query_low:
-            state["is_employee"], state["visitor_type"] = True, "Employee"
+
+        # Only mark the speaker as an employee when THEY explicitly say so.
+        # Never infer it just from a name collision with the employee table.
+        speaker_claims_employee = (
+            "i am an employee" in query_low
+            or "i work here" in query_low
+            or bool(
+                re.search(
+                    r"\bi\s+am\b.{0,30}\b" + re.escape(new_name.lower()) + r"\b",
+                    query_low,
+                )
+            )
+        )
+        if speaker_claims_employee:
+            emp_record = get_employee_by_name(new_name)
+            if emp_record:
+                state["is_employee"] = True
+                state["visitor_type"] = "Employee"
+
+        # Update visitor name in session
         if state.get("visitor_name") and state["visitor_name"] != new_name:
-            state["visitor_name"], state["identity_updated"] = new_name, True
+            state["visitor_name"] = new_name
+            state["identity_updated"] = True
         elif not state.get("visitor_name"):
             state["visitor_name"] = new_name
 
+    # ── Visitor type from context clues ──────────────────────────────────────
     state["visitor_type"] = _determine_visitor_type(
         user_query, entities.get("purpose", ""), state["visitor_type"]
     )
+
+    # ── Host / employee to meet (never treated as the speaker) ───────────────
     target = (
         entities.get("employee_name")
         or entities.get("employee_role")
@@ -451,11 +496,13 @@ def _merge_checkin_entities(
         state["meeting_with_raw"] = target
         emp = _lookup_employee(target)
         if emp:
-            state["meeting_with_resolved"] = state["sched_employee_name"] = emp.name
+            state["meeting_with_resolved"] = emp.name
+            state["sched_employee_name"] = emp.name
             state["sched_employee_email"] = emp.email
         else:
             state["meeting_with_resolved"] = target
 
+    # ── Date / time / purpose ─────────────────────────────────────────────────
     if entities.get("date"):
         state["sched_date"] = _normalize_date(str(entities["date"]))
     if entities.get("time"):
