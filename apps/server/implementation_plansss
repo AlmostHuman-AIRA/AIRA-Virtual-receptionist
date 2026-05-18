@@ -1,0 +1,310 @@
+# Replace Wake Word with Camera-Based Presence Detection (MediaPipe)
+
+Replace the current "Hey Jarvis" wake word activation with automatic person-presence detection using **MediaPipe Face Detection**. When a person stands in front of the camera for a sustained period (~3 seconds), AIRA activates and speaks the greeting — no voice trigger needed.
+
+## Why MediaPipe Over YOLOv8?
+
+We evaluated five approaches for person presence detection. Here's why MediaPipe wins for a virtual receptionist:
+
+| Approach | New Deps | CPU Speed | Accuracy | Verdict |
+|---|---|---|---|---|
+| **MediaPipe Face Detection** ⭐ | `mediapipe` (~30MB) | **~10-30ms** | 95%+ | **Best fit** — detects faces facing the camera |
+| OpenCV Haar Cascades | None | ~5-15ms | 80-85% | Too many false positives/negatives |
+| OpenCV DNN (SSD MobileNet) | None + model file | ~30-50ms | ~90% | Good but requires manual model management |
+| YOLOv8n (`ultralytics`) | `ultralytics` (~20MB+) | ~50-100ms | 95%+ | **Overkill** — detects 80 COCO classes when we only need faces |
+| Reuse DeepFace's SSD | None | ~100-200ms | ~85% | Too slow for a polling loop |
+
+**Key reasons MediaPipe is better than YOLOv8 for this use case:**
+
+1. **Detects what actually matters** — A face *facing the camera*, not just any person. YOLOv8 would trigger on someone walking 20 feet behind the kiosk with their back turned. MediaPipe only fires when someone is **looking at the screen** — exactly when a receptionist should greet them.
+
+2. **3-5× faster on CPU** — 10-30ms vs 50-100ms per frame. This matters because we're running detection in a loop every 1.5 seconds alongside audio processing, VAD, and DeepFace.
+
+3. **Gives face position + size** — The bounding box tells us if the person is "close enough" (large face = standing at the kiosk) vs "far away" (small face = walking past). YOLO gives a person bounding box but can't distinguish someone at the desk from someone across the room as intuitively.
+
+4. **Lighter dependency** — `mediapipe` is a focused package. `ultralytics` pulls in the entire YOLOv8 ecosystem (training, export, tracking) when we only need one inference call.
+
+5. **Built for exactly this** — Google designed MediaPipe Face Detection for real-time face detection on mobile/edge CPUs. A kiosk receptionist is its ideal deployment scenario.
+
+---
+
+## User Review Required
+
+> [!IMPORTANT]
+> **Camera Always-On Requirement**: For presence detection to work, the camera must be running continuously. The current UX requires the user to manually toggle the camera on. The plan changes this so the camera **auto-starts** when the page loads. The floating camera widget becomes always-visible (but still draggable/resizable/closeable).
+
+> [!IMPORTANT]
+> **Wake Word Kept as Fallback**: The wake word ("Hey Jarvis") will still work as a secondary activation method. Both coexist — whichever triggers first wins.
+
+> [!WARNING]
+> **New Dependency: `mediapipe`** (~30MB). Runs purely on CPU with no GPU requirement. First inference takes ~200-500ms (model load), subsequent ones ~10-30ms. Very lightweight for your CPU-compatible setup.
+
+## How It Works
+
+```mermaid
+sequenceDiagram
+    participant Client as Browser (Camera)
+    participant WS as WebSocket
+    participant Server as Python Server
+    participant MP as MediaPipe Face Detection
+
+    Note over Client: Camera auto-starts on page load
+    
+    loop Every 1.5s while PASSIVE
+        Client->>WS: { type: "presence_frame", image_b64: "..." }
+        WS->>Server: Forward frame
+        Server->>MP: detect_face(frame)
+        MP-->>Server: face_detected: true/false, face_size_ratio: 0.18
+        
+        alt Face detected & large enough (2+ consecutive frames)
+            Server->>WS: { type: "person_detected" }
+            WS->>Client: Trigger wake-up UI feedback
+            Note over Server: Mode → PROCESSING → speaks greeting
+        else No face or too small
+            Note over Server: Reset consecutive count to 0
+        end
+    end
+    
+    Note over Server: Normal conversation flow continues...
+    
+    Note over Server: When session ends → back to PASSIVE
+    Note over Client: Resume sending presence frames
+```
+
+## Proposed Changes
+
+### Person Detection Service (Server)
+
+#### [NEW] [person_detection_service.py](file:///c:/Users/Administrator/Desktop/CPU-compatible-AI-/apps/server/services/person_detection_service.py)
+
+New service using MediaPipe Face Detection for lightweight presence detection:
+
+```python
+# Key design:
+class PersonDetectionService:
+    """Singleton MediaPipe Face Detection wrapper for presence detection."""
+    
+    def __init__(self):
+        import mediapipe as mp
+        self.face_detection = mp.solutions.face_detection.FaceDetection(
+            model_selection=0,       # 0 = short-range (< 2m), ideal for kiosk
+            min_detection_confidence=0.5
+        )
+    
+    def detect_person(self, image_b64: str) -> dict:
+        """Returns {detected: bool, confidence: float, face_ratio: float}"""
+        # 1. Decode base64 → numpy array (RGB)
+        # 2. Run MediaPipe face detection
+        # 3. Check if any face found AND face bounding box is large enough
+        #    (face_ratio = face_area / frame_area, threshold ~0.02 = ~15% of frame width)
+        # 4. Return result
+```
+
+Key features:
+- **`model_selection=0`** — Short-range model optimized for faces within 2 meters (perfect for a reception desk)
+- **`min_detection_confidence`** — Configurable via `PRESENCE_DETECT_CONFIDENCE` env var (default: `0.5`)
+- **`MIN_FACE_RATIO`** — Minimum face-to-frame size ratio via `PRESENCE_MIN_FACE_RATIO` env var (default: `0.02`). Prevents triggering on small faces far away
+- **Singleton pattern** — Model loaded once, reused across all WebSocket sessions
+- **`warmup_mediapipe()`** — Pre-loads the model at server startup (same pattern as `warmup_deepface()`)
+
+---
+
+### WebSocket Routes (Server)
+
+#### [MODIFY] [websocket_routes.py](file:///c:/Users/Administrator/Desktop/CPU-compatible-AI-/apps/server/routes/websocket_routes.py)
+
+Changes to the main WebSocket state machine in the `listener()` function:
+
+**1. New imports and setup (top of file):**
+```python
+from services.person_detection_service import get_person_detection_service, warmup_mediapipe
+
+# Reuse the existing _face_executor thread pool (add 1 more worker)
+_face_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="deepface")
+
+# Warm up MediaPipe alongside DeepFace
+_face_executor.submit(warmup_mediapipe)
+```
+
+**2. New session state keys:**
+```python
+session_state = {
+    ...
+    "presence_count": 0,             # consecutive frames with face detected
+    "last_presence_trigger": 0.0,    # timestamp of last activation (cooldown)
+}
+```
+
+**3. New message handler in `listener()` for `presence_frame`:**
+```python
+if msg.get("type") == "presence_frame":
+    # Only process in PASSIVE mode
+    if session_state["mode"] != "PASSIVE":
+        continue
+    
+    # Cooldown: skip if we triggered recently (prevent rapid re-activation)
+    if time.time() - session_state["last_presence_trigger"] < 5.0:
+        continue
+    
+    image_b64 = msg.get("image_b64", "")
+    if not image_b64:
+        continue
+    
+    # Run MediaPipe detection in thread pool (non-blocking)
+    detection_service = get_person_detection_service()
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(
+        _face_executor,
+        lambda: detection_service.detect_person(image_b64)
+    )
+    
+    if result["detected"]:
+        session_state["presence_count"] += 1
+        logger.info(
+            f"[{client_id}] Person detected (count={session_state['presence_count']}, "
+            f"confidence={result['confidence']:.2f}, face_ratio={result['face_ratio']:.3f})"
+        )
+        
+        if session_state["presence_count"] >= 2:  # PRESENCE_CONFIRM_FRAMES
+            logger.info(f"[{client_id}] ✅ Person confirmed! Activating AIRA.")
+            session_state["presence_count"] = 0
+            session_state["last_presence_trigger"] = time.time()
+            session_state["mode"] = "PROCESSING"
+            
+            # Notify frontend
+            await websocket.send_text(json.dumps({"type": "person_detected"}))
+            
+            # Reuse existing wake-up flow
+            await text_queue.put("WAKE_WORD_TRIGGERED")
+            oww_carry.clear()
+            audio_buffer.clear()
+            speech_seen = False
+    else:
+        # No face → reset consecutive count
+        session_state["presence_count"] = 0
+```
+
+**4. Reset presence state on PASSIVE transition** (existing reset block around line 340-354):
+```python
+if current_mode == "PASSIVE" and previous_mode != "PASSIVE":
+    ...
+    session_state["presence_count"] = 0
+    # Don't reset last_presence_trigger — cooldown should persist
+```
+
+**5. Wake word detection remains unchanged** — both activation methods coexist in the PASSIVE audio processing block.
+
+---
+
+### Dependencies
+
+#### [MODIFY] [pyproject.toml](file:///c:/Users/Administrator/Desktop/CPU-compatible-AI-/apps/server/pyproject.toml)
+
+Add `mediapipe` to dependencies:
+```diff
+ dependencies = [
+     ...
++    "mediapipe>=0.10.0",          # Face detection for presence-based activation
+ ]
+```
+
+---
+
+### Client-Side: Auto-Start Camera & Send Presence Frames
+
+#### [NEW] [usePresenceDetection.ts](file:///c:/Users/Administrator/Desktop/CPU-compatible-AI-/apps/client/src/hooks/usePresenceDetection.ts)
+
+New hook that orchestrates the presence detection loop:
+
+```typescript
+export function usePresenceDetection(
+  cameraRef: React.RefObject<CameraStreamHandle | null>,
+  serverState: string  // "passive" | "listening" | "processing" | "speaking"
+) {
+  const { sendPresenceFrame, onPersonDetected } = useWebSocketContext();
+  const [personDetected, setPersonDetected] = useState(false);
+  
+  useEffect(() => {
+    // Only send frames when AIRA is passive (waiting for someone)
+    if (serverState !== "passive") return;
+    
+    const intervalId = setInterval(() => {
+      const frame = cameraRef.current?.captureFrame();
+      if (frame) sendPresenceFrame(frame);
+    }, 1500); // Every 1.5 seconds
+    
+    return () => clearInterval(intervalId);
+  }, [serverState, cameraRef, sendPresenceFrame]);
+  
+  // Listen for person_detected event from server
+  useEffect(() => {
+    onPersonDetected?.(() => setPersonDetected(true));
+  }, [onPersonDetected]);
+  
+  return { personDetected };
+}
+```
+
+#### [MODIFY] [WebSocketContext.tsx](file:///c:/Users/Administrator/Desktop/CPU-compatible-AI-/apps/client/src/contexts/WebSocketContext.tsx)
+
+Add two new capabilities:
+
+1. **`sendPresenceFrame(imageB64: string)`** — Sends `{"type": "presence_frame", "image_b64": "..."}` over the WebSocket
+2. **`onPersonDetected(callback: () => void)`** — Registers callback for `{"type": "person_detected"}` messages from server
+
+Changes:
+- Add `sendPresenceFrame` to the context interface and value
+- Add `personDetectedCallbackRef` + handler in `onmessage`
+- Add `onPersonDetected` callback registration method
+
+#### [MODIFY] [page.tsx](file:///c:/Users/Administrator/Desktop/CPU-compatible-AI-/apps/client/src/app/page.tsx)
+
+- **Auto-show camera on mount** — The `CameraStream` renders immediately (always visible), no manual toggle button
+- Camera auto-starts via `autoStartSignal`
+- Wire up the `usePresenceDetection` hook with `serverState` tracking
+- Keep face verification badge as-is (it activates after the greeting, during identity check)
+- Add subtle UI feedback when person is detected (e.g., camera border glow)
+
+#### [MODIFY] [CameraStream.tsx](file:///c:/Users/Administrator/Desktop/CPU-compatible-AI-/apps/client/src/components/CameraStream.tsx)
+
+Minimal changes:
+- No structural changes needed — already supports `autoStartSignal` and `captureFrame()`
+- Optionally: add a `presenceDetected` prop to show a subtle green border pulse when AIRA detects someone
+
+---
+
+## Configuration Summary
+
+All tunable via environment variables in `.env`:
+
+| Variable | Default | Description |
+|---|---|---|
+| `PRESENCE_DETECT_CONFIDENCE` | `0.5` | MediaPipe minimum detection confidence (0.0-1.0) |
+| `PRESENCE_MIN_FACE_RATIO` | `0.02` | Minimum face-area / frame-area ratio (~15% of frame width) |
+| `PRESENCE_CONFIRM_FRAMES` | `2` | Consecutive positive detections before activation |
+| `PRESENCE_FRAME_COOLDOWN` | `5.0` | Seconds to wait after activation before accepting new presence frames |
+
+## Open Questions
+
+> [!IMPORTANT]
+> **Frame Send Interval**: Currently planned at **1.5 seconds**. Faster (1s) = more responsive but more CPU/bandwidth. Slower (2s) = less responsive but lighter. What feels right for your reception desk setup?
+
+> [!IMPORTANT]
+> **Consecutive Frames Threshold**: Currently **2 consecutive positive detections** (~3 seconds total) before activation. Higher = more cautious (fewer false triggers), Lower = more responsive. Your preference?
+
+## Verification Plan
+
+### Automated Tests
+- Run the server and verify MediaPipe model loads without errors via `warmup_mediapipe()`
+- Send a test `presence_frame` over WebSocket and verify detection response in logs
+- Verify wake word still works alongside presence detection (both coexist)
+- Test with no face in frame → verify no false activation
+
+### Manual Verification  
+1. Open the client page → camera should auto-start immediately
+2. Stand in front of the camera → AIRA should activate within ~3 seconds and speak the greeting
+3. Walk away and come back → AIRA should re-activate after the cooldown period
+4. Walk past quickly → AIRA should NOT trigger (single frame, need 2 consecutive)
+5. Stand far away → AIRA should NOT trigger (face too small, below `MIN_FACE_RATIO`)
+6. Say "Hey Jarvis" without being on camera → should still work as fallback
+7. During an active conversation → presence frames should NOT be processed (mode ≠ PASSIVE)

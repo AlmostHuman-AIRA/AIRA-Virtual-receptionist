@@ -11,11 +11,14 @@ import {
 } from '@/components/ui/card';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 
-import { useWebSocketContext } from '@/contexts/WebSocketContext';
+import {
+  useWebSocketContext,
+  type ServerState
+} from '@/contexts/WebSocketContext';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-type BackendState = 'passive' | 'listening' | 'processing' | 'speaking';
+type BackendState = ServerState;
 
 // ─── Status Orb ───────────────────────────────────────────────────────────────
 
@@ -90,12 +93,11 @@ const Dot: React.FC<{ active: boolean; color: string; label: string }> = ({
 // ─── Main Component ───────────────────────────────────────────────────────────
 
 const VoiceActivityDetector: React.FC = () => {
-  const [backendState, setBackendState] = useState<BackendState>('passive');
+  const [connectionLost, setConnectionLost] = useState(false);
   const [micActive, setMicActive] = useState(false);
   const [micError, setMicError] = useState<string | null>(null);
 
-  const { sendAudioSegment, onServerState, isConnected } =
-    useWebSocketContext();
+  const { sendAudioSegment, serverState, isConnected } = useWebSocketContext();
 
   const audioContextRef = useRef<AudioContext | null>(null);
   const processorRef = useRef<ScriptProcessorNode | null>(null);
@@ -103,15 +105,8 @@ const VoiceActivityDetector: React.FC = () => {
   const streamRef = useRef<MediaStream | null>(null);
   const pcmCarryRef = useRef<number[]>([]);
 
-  // 1. Listen for State Changes from Backend
   useEffect(() => {
-    onServerState((state) => setBackendState(state));
-  }, [onServerState]);
-
-  useEffect(() => {
-    if (!isConnected) {
-      setBackendState('passive');
-    }
+    setConnectionLost(!isConnected);
   }, [isConnected]);
 
   // 2. Start Microphone IMMEDIATELY on mount
@@ -241,24 +236,32 @@ const VoiceActivityDetector: React.FC = () => {
 
       <CardContent className="flex flex-col items-center gap-6">
         {/* Main status orb */}
-        <StatusOrb state={backendState} />
+
+        {connectionLost && (
+          <Alert className="w-full border-yellow-300 bg-yellow-50">
+            <AlertDescription className="text-center text-sm text-yellow-700">
+              Connection lost — reconnecting...
+            </AlertDescription>
+          </Alert>
+        )}
+        <StatusOrb state={serverState} />
 
         {/* Indicator dots row */}
         <div className="flex gap-6">
           <Dot active={isConnected} color="bg-green-500" label="Connected" />
           <Dot active={micActive} color="bg-blue-500" label="Mic Active" />
           <Dot
-            active={backendState === 'listening'}
+            active={serverState === 'listening'}
             color="bg-blue-400"
             label="Listening"
           />
           <Dot
-            active={backendState === 'processing'}
+            active={serverState === 'processing'}
             color="bg-yellow-400"
             label="Processing"
           />
           <Dot
-            active={backendState === 'speaking'}
+            active={serverState === 'speaking'}
             color="bg-green-400"
             label="Speaking"
           />

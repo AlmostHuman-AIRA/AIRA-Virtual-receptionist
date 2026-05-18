@@ -10,6 +10,8 @@ import {
   CameraToggleButtonHandle
 } from '@/components/CameraStream';
 import { useFaceVerification } from '@/hooks/useFaceVerification';
+import { usePresenceDetection } from '@/hooks/usePresenceDetection';
+import { useWebSocketContext } from '@/contexts/WebSocketContext';
 
 export default function Home() {
   const cameraRef = useRef<CameraStreamHandle | null>(null);
@@ -22,8 +24,14 @@ export default function Home() {
     }
   );
 
+  const { serverState } = useWebSocketContext();
+
+  const { personDetected } = usePresenceDetection(cameraRef, serverState);
+
   return (
-    <main className="relative min-h-screen bg-gradient-to-br from-gray-50 to-gray-100">
+    <main
+      className={`relative min-h-screen bg-gradient-to-br from-gray-50 to-gray-100 transition-colors duration-1000 ${personDetected ? 'rounded-lg border-4 border-green-500 shadow-[inset_0_0_50px_rgba(34,197,94,0.3)]' : ''}`}
+    >
       <div className="container mx-auto px-4 py-8">
         {/* Header */}
         <div className="mb-8 text-center">

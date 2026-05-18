@@ -14,6 +14,8 @@ from core.config import logger
 from core.lifespan import lifespan
 
 from services.query_router import route_query, clear_session_state
+import threading
+from receptionist.cleanup_old_visitors import purge_old_visitors
 
 app = FastAPI(
     title="AlmostHuman Voice Assistant",

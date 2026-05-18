@@ -17,7 +17,11 @@ from receptionist.database import (
 )
 from receptionist.models import Employee, Visitor, Meeting, ReceptionLog
 from models.groq_processor import BASE_SYSTEM_PROMPT, GroqProcessor
-from services.notify_slack import send_slack_arrival, clear_session as clear_slack_cache
+from services.notify_slack import (
+    send_slack_arrival,
+    send_slack_meeting_scheduled,
+    clear_session as clear_slack_cache,
+)
 from services.calendar_service import schedule_google_meeting_background
 from services.slack_reply_store import pop_reply
 
@@ -340,6 +344,18 @@ def _notify_host_pending(state: Dict[str, Any]) -> bool:
         host_name = state["sched_employee_name"]
         emp = _lookup_employee(host_name)
         narrative = _format_descriptive_purpose(state, "SCHEDULED")
+        mid = schedule_meeting(
+            v_name,
+            "Visitor",
+            host_name,
+            state["sched_date"],
+            state["sched_time"],
+            narrative,
+        )
+        if mid == -1:
+            return -1  # conflict — slot already booked
+        if not mid:
+            return False  # other failure (employee not found, bad datetime, etc.)
 
         visitor = db.query(Visitor).filter(Visitor.name.ilike(v_name)).first()
         if not visitor:
@@ -356,7 +372,15 @@ def _notify_host_pending(state: Dict[str, Any]) -> bool:
         )
         db.add(log)
         db.commit()
-
+        send_slack_meeting_scheduled(
+            host_name=host_name,
+            host_email=state.get("sched_employee_email", ""),
+            visitor_name=v_name,
+            date_str=state["sched_date"],
+            time_str=state["sched_time"],
+            purpose=state.get("sched_purpose") or state.get("purpose") or "Meeting",
+            session_id=state["session_id"],
+        )
         send_slack_arrival(
             host_name, v_name, state["visitor_type"], narrative, state["session_id"]
         )
@@ -566,9 +590,24 @@ async def _handle_directory_lookup(
     )
 
 
+async def _finalize_checkin_and_respond(
+    state: Dict[str, Any], query: str, client_id: str
+) -> str:
+    logger.info(
+        f"[finalize] visitor={state.get('visitor_name')} "
+        f"host={state.get('meeting_with_resolved')} "
+        f"type={state.get('visitor_type')}"
+    )
+
+
 async def _finalize_checkin_and_respond(state, query, client_id):
     if not state.get("visitor_name"):
         return await _llm_reply("Ask for their name politely.", state, query, client_id)
+
+    if not state.get("meeting_with_resolved"):
+        semantic_host = _lookup_employee(state.get("purpose", "") + " " + query)
+        if semantic_host and semantic_host.name != "Administration Team":
+            state["meeting_with_resolved"] = semantic_host.name
 
     # Build the full list of hosts to notify — fall back to single host if needed
     all_hosts: List[str] = state.get("all_hosts") or []
@@ -739,8 +778,11 @@ async def route_query(client_id: str, user_query: str) -> str:
         state["meeting_with_resolved"] = "Administration Team"
 
     if any(w in query_low for w in ["thank you", "thanks", "bye", "goodbye"]):
-        reply = await llm.get_raw_response(
-            f"Warm closing for: {user_query}", client_id=client_id
+        reply = await _llm_reply(
+            "Give a single warm farewell sentence. Use the visitor's name if you know it. Do NOT list multiple options.",
+            state,
+            user_query,
+            client_id,
         )
         clear_session_state(client_id)
         return reply
@@ -748,9 +790,23 @@ async def route_query(client_id: str, user_query: str) -> str:
     if any(x in query_low for x in ["free time", "available", "is he free"]):
         return await _handle_availability_check(state, user_query, client_id)
 
-    if intent == "employee_lookup" or any(
-        x in query_low for x in ["who is", "director", "ceo"]
-    ):
+    _LOOKUP_ONLY_PHRASES = ["who is", "where is", "which floor", "what department"]
+    _NOTIFY_PHRASES = [
+        "notify",
+        "tell",
+        "inform",
+        "waiting",
+        "let him know",
+        "let her know",
+        "please notify",
+        "i'm here",
+        "i am here",
+    ]
+    is_notify_intent = any(w in query_low for w in _NOTIFY_PHRASES)
+    is_lookup_intent = intent == "employee_lookup" or any(
+        x in query_low for x in _LOOKUP_ONLY_PHRASES
+    )
+    if is_lookup_intent and not is_notify_intent:
         return await _handle_directory_lookup(state, user_query, client_id)
 
     if intent == "schedule_meeting" or state["scheduling_active"]:
@@ -760,11 +816,8 @@ async def route_query(client_id: str, user_query: str) -> str:
             and state["sched_employee_name"]
             and state["sched_date"]
             and state["sched_time"]
-            and not state.get("awaiting_slack_reply")
         ):
-            # All fields present — go through _handle_scheduling which will
-            # call _notify_host_pending and wait for the host's Slack reply.
-            pass
+            return await _handle_scheduling(client_id, user_query, state, intent)
         return await _handle_scheduling(client_id, user_query, state, intent)
 
     if intent == "check_in" or state["meeting_with_resolved"]:
