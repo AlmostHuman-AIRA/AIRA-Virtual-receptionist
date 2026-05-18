@@ -18,6 +18,21 @@ interface WordTiming {
 
 type TimingPayload = unknown;
 
+export type ServerState = 'passive' | 'listening' | 'processing' | 'speaking';
+
+const SERVER_STATES: readonly ServerState[] = [
+  'passive',
+  'listening',
+  'processing',
+  'speaking'
+];
+
+function normalizeServerState(raw: string | undefined): ServerState | null {
+  if (!raw) return null;
+  const lower = raw.toLowerCase() as ServerState;
+  return SERVER_STATES.includes(lower) ? lower : null;
+}
+
 interface WebSocketMessage {
   status?: string;
   client_id?: string;
@@ -49,6 +64,7 @@ export interface FaceVerificationRequestOptions {
 interface WebSocketContextType {
   isConnected: boolean;
   isConnecting: boolean;
+  serverState: ServerState;
   connect: () => Promise<void>;
   disconnect: () => void;
   sendAudioSegment: (audioData: ArrayBuffer) => void;
@@ -68,11 +84,7 @@ interface WebSocketContextType {
   onStatusChange: (
     callback: (status: 'connected' | 'disconnected' | 'connecting') => void
   ) => void;
-  onServerState: (
-    callback: (
-      state: 'passive' | 'listening' | 'processing' | 'speaking'
-    ) => void
-  ) => void;
+  onServerState: (callback: (state: ServerState) => void) => () => void;
   sendFaceVerificationRequest?: (
     audioName: string,
     imageB64: string,
@@ -83,7 +95,7 @@ interface WebSocketContextType {
   onVerificationResult?: (callback: (data: WebSocketMessage) => void) => void;
   onEmployeeIdentified?: (callback: (employeeName: string) => void) => void;
   onRequestFaceFrame?: (callback: (data: WebSocketMessage) => void) => void;
-  onStateChange?: (callback: (state: string) => void) => void;
+  onStateChange?: (callback: (state: ServerState) => void) => () => void;
 }
 
 const WebSocketContext = createContext<WebSocketContextType | null>(null);
@@ -110,6 +122,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({
   const wsRef = useRef<WebSocket | null>(null);
   const [isConnected, setIsConnected] = useState(false);
   const [isConnecting, setIsConnecting] = useState(false);
+  const [serverState, setServerState] = useState<ServerState>('passive');
 
   // Generate a unique client ID for this browser session
   const clientId = useMemo(
@@ -135,10 +148,9 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({
   const statusChangeCallbackRef = useRef<
     ((status: 'connected' | 'disconnected' | 'connecting') => void) | null
   >(null);
-  const serverStateCallbackRef = useRef<
-    | ((state: 'passive' | 'listening' | 'processing' | 'speaking') => void)
-    | null
-  >(null);
+  const serverStateListenersRef = useRef(
+    new Set<(state: ServerState) => void>()
+  );
   const faceVerificationResultCallbackRef = useRef<
     ((data: WebSocketMessage) => void) | null
   >(null);
@@ -149,7 +161,18 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({
   const requestFaceFrameCallbackRef = useRef<
     ((data: WebSocketMessage) => void) | null
   >(null);
-  const stateChangeCallbackRef = useRef<((state: string) => void) | null>(null);
+  const stateChangeListenersRef = useRef(
+    new Set<(state: ServerState) => void>()
+  );
+
+  const applyServerState = useCallback((raw: string | undefined) => {
+    const normalized = normalizeServerState(raw);
+    if (!normalized) return;
+
+    setServerState(normalized);
+    serverStateListenersRef.current.forEach((listener) => listener(normalized));
+    stateChangeListenersRef.current.forEach((listener) => listener(normalized));
+  }, []);
 
   const connect = useCallback(async () => {
     if (wsRef.current?.readyState === WebSocket.OPEN) return;
@@ -172,12 +195,6 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({
         try {
           const data: WebSocketMessage = JSON.parse(event.data);
           console.log('WebSocket message received:', data);
-
-          if (data.status === 'connected') {
-            console.log(
-              `Server confirmed connection. Client ID: ${data.client_id}`
-            );
-          }
 
           if (data.status === 'connected') {
             console.log(
@@ -208,10 +225,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({
           }
 
           if (data.state) {
-            serverStateCallbackRef.current?.(
-              data.state as 'passive' | 'listening' | 'processing' | 'speaking'
-            );
-            stateChangeCallbackRef.current?.(data.state);
+            applyServerState(data.state);
           }
 
           if (data.interrupt) {
@@ -220,6 +234,8 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({
           }
 
           if (data.audio) {
+            applyServerState(data.state ?? 'speaking');
+
             // Handle audio with native timing
             let timingData = null;
 
@@ -280,6 +296,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({
       wsRef.current.onclose = () => {
         setIsConnected(false);
         setIsConnecting(false);
+        applyServerState('passive');
         statusChangeCallbackRef.current?.('disconnected');
         console.log('WebSocket disconnected — attempting reconnect in 2s...');
         setTimeout(() => {
@@ -293,7 +310,7 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({
       setIsConnecting(false);
       errorCallbackRef.current?.('Failed to connect to WebSocket server');
     }
-  }, [fullWsUrl]);
+  }, [applyServerState, fullWsUrl]);
 
   const disconnect = useCallback(() => {
     if (wsRef.current) {
@@ -399,9 +416,16 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({
     personDetectedCallbackRef.current = callback;
   }, []);
 
-  const onStateChange = useCallback((callback: (state: string) => void) => {
-    stateChangeCallbackRef.current = callback;
-  }, []);
+  const onStateChange = useCallback(
+    (callback: (state: ServerState) => void) => {
+      stateChangeListenersRef.current.add(callback);
+      callback(serverState);
+      return () => {
+        stateChangeListenersRef.current.delete(callback);
+      };
+    },
+    [serverState]
+  );
 
   // Callback registration methods
   const onVerificationResult = useCallback(
@@ -450,19 +474,20 @@ export const WebSocketProvider: React.FC<WebSocketProviderProps> = ({
   );
 
   const onServerState = useCallback(
-    (
-      callback: (
-        state: 'passive' | 'listening' | 'processing' | 'speaking'
-      ) => void
-    ) => {
-      serverStateCallbackRef.current = callback;
+    (callback: (state: ServerState) => void) => {
+      serverStateListenersRef.current.add(callback);
+      callback(serverState);
+      return () => {
+        serverStateListenersRef.current.delete(callback);
+      };
     },
-    []
+    [serverState]
   );
 
   const value: WebSocketContextType = {
     isConnected,
     isConnecting,
+    serverState,
     connect,
     disconnect,
     sendAudioSegment,
