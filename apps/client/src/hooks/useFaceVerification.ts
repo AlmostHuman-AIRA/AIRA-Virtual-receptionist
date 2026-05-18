@@ -178,7 +178,7 @@ export function useFaceVerification(
   useEffect(() => {
     if (!onStateChange) return;
 
-    onStateChange((state) => {
+    return onStateChange((state) => {
       if (state === 'passive') {
         stopBackgroundLoop('session ended (passive)');
       }
