@@ -189,13 +189,28 @@ _VISITOR_KEYWORDS = (
 
 def _detect_person_type(text: str) -> str:
     """
-    Returns 'visitor' if the transcript contains delivery/visitor keywords,
-    otherwise returns 'employee'.
+    Returns 'visitor' if the transcript contains delivery/visitor keywords
+    OR if the person is simply introducing themselves (not an employee greeting).
+    Otherwise returns 'employee'.
     """
     lower = text.lower()
+
+    # Explicit visitor/delivery keywords
     for keyword in _VISITOR_KEYWORDS:
         if keyword in lower:
             return "visitor"
+
+    # Self-introduction patterns ("I am X", "I'm X", "my name is X", "X here")
+    # without any employee claim → treat as visitor until DB proves otherwise
+    intro_pattern = re.search(r"\b(i am|i'm|my name is|this is)\b", lower)
+    if intro_pattern:
+        # If they also say "i work here" / "i'm an employee" → employee
+        if re.search(
+            r"\b(i work here|i am an employee|i'm an employee|staff)\b", lower
+        ):
+            return "employee"
+        return "visitor"
+
     return "employee"
 
 
@@ -907,7 +922,29 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                             loop = asyncio.get_event_loop()
 
                                             if detected_person_type == "visitor":
-                                                if candidates:
+                                                # Check if router already identified this visitor by name
+                                                # (from a prior utterance like "Hello I am Ellie here.")
+                                                # If so, ALWAYS use that name — never re-extract from the
+                                                # current utterance which may contain a host/employee name.
+                                                from services.query_router import (
+                                                    get_session_state as _get_router_state,
+                                                )
+
+                                                router_state = _get_router_state(
+                                                    client_id
+                                                )
+                                                known_visitor = router_state.get(
+                                                    "visitor_name"
+                                                )  # e.g. "Ellie"
+
+                                                if known_visitor:
+                                                    employee_name = known_visitor
+                                                    logger.info(
+                                                        f"[{client_id}] Visitor already known as '{known_visitor}' "
+                                                        f"from router state — using that for face capture, "
+                                                        f"ignoring extracted candidates {candidates}."
+                                                    )
+                                                elif candidates:
                                                     employee_name = candidates[0]
                                                     logger.info(
                                                         f"[{client_id}] Visitor detected. "
@@ -929,7 +966,6 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                                         )
                                                         break
 
-                                    # If we found a name, trigger face capture/verification
                                     # If we found a name, trigger face capture/verification
                                     if employee_name:
                                         person_type = session_state["person_type"]
@@ -1025,32 +1061,39 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                 manager.client_state[client_id] = "THINKING"
                 session_state["brain_is_thinking"] = True
 
-                # --- BYPASS LLM FOR SLACK REPLY SENTINELS ---
-                # --- BYPASS LLM FOR SLACK REPLY SENTINELS ---
-                if text and text.startswith("SLACK_REPLY:"):
-                    # Pass the raw sentinel directly to query_router so it can handle calendar booking
-                    reply_text = await process_text_for_client(client_id, text)
-                    session_state["brain_is_thinking"] = False
-
-                # --- BYPASS LLM FOR SYSTEM MESSAGES ---
-                elif text and text.startswith("SYSTEM:"):
-                    reply_text = text.split("SYSTEM:", 1)[1]
-                else:
-                    # --- INJECT USER IDENTITY INTO LLM PROMPT ---
-                    verified_name = session_state.get("verified_name")
-                    if verified_name:
-                        # Secretly tell the LLM who is speaking
-                        prompt_text = f"[System Note: The user speaking is verified as {verified_name}] {text}"
-                    else:
-                        prompt_text = text
-
-                    reply_text = await process_text_for_client(client_id, prompt_text)
-                    session_state["brain_is_thinking"] = False
-
-                logger.info(f"[{client_id}] AI Response generated: '{reply_text}'")
-
-                # --- THE TRY BLOCK STARTS HERE ---
+                # --- THE TRY BLOCK NOW WRAPS EVERYTHING (FIX #2) ---
+                # Previously the try only wrapped TTS/audio sending.
+                # If process_text_for_client raised on the SLACK_REPLY path,
+                # task_done() was never called and the queue jammed permanently.
                 try:
+                    # --- BYPASS LLM FOR SLACK REPLY SENTINELS ---
+                    if text and text.startswith("SLACK_REPLY:"):
+                        # FIX #1: force mode back to FOLLOWUP so the session is
+                        # "alive" when brain() tries to send audio back to the user.
+                        # Without this, the 12s FOLLOWUP timeout may have already
+                        # flipped mode → PASSIVE before the watcher injected this item.
+                        session_state["mode"] = "FOLLOWUP"
+                        # Pass the raw sentinel directly to query_router
+                        reply_text = await process_text_for_client(client_id, text)
+
+                    # --- BYPASS LLM FOR SYSTEM MESSAGES ---
+                    elif text and text.startswith("SYSTEM:"):
+                        reply_text = text.split("SYSTEM:", 1)[1]
+
+                    else:
+                        # --- INJECT USER IDENTITY INTO LLM PROMPT ---
+                        verified_name = session_state.get("verified_name")
+                        if verified_name:
+                            prompt_text = f"[System Note: The user speaking is verified as {verified_name}] {text}"
+                        else:
+                            prompt_text = text
+
+                        reply_text = await process_text_for_client(
+                            client_id, prompt_text
+                        )
+
+                    logger.info(f"[{client_id}] AI Response generated: '{reply_text}'")
+
                     if not reply_text or not reply_text.strip():
                         session_state["mode"] = "PASSIVE"
                         await websocket.send_text(json.dumps({"state": "passive"}))
@@ -1097,34 +1140,31 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                     # --------------------------------
 
                 except (RuntimeError, WebSocketDisconnect):
-                    # This catches the error if the user closes the tab
                     logger.info(
                         f"[{client_id}] Client disconnected before AI could finish responding."
                     )
                     break
                 finally:
                     session_state["brain_is_thinking"] = False
-                    # This ensures the queue is ALWAYS marked as done, even if it errors or continues
+                    # task_done() now ALWAYS runs — no matter which branch above
+                    # was taken, and no matter whether an exception was raised.
                     text_queue.task_done()
 
         async def slack_watcher():
             """
-            Polls for Slack replies every 3 seconds independently of session mode.
-            Survives PASSIVE/FOLLOWUP transitions.
+            Polls Slack's API directly every 3 seconds for a reply in the
+            thread that was opened for this session.
+            No webhook, no tunnel, no Events API required.
             """
-            from services.slack_reply_store import (
-                pop_reply as _pop_reply,
-                pop_any_channel_reply as _pop_channel,
-            )
+            from services.slack_reply_poller import poll_for_reply
             from services.query_router import get_session_state as _get_state
 
-            POLL_INTERVAL = 3  # seconds between checks
-            MAX_WAIT = 120  # stop waiting for a specific reply after 2 minutes
+            POLL_INTERVAL = 3
+            MAX_WAIT = 120
 
             logger.info(f"[{client_id}] slack_watcher STARTED")
             elapsed = 0
 
-            # FIX: Use an infinite loop so the watcher doesn't die while the system is idle
             while True:
                 await asyncio.sleep(POLL_INTERVAL)
 
@@ -1136,7 +1176,6 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                     )
                     break
 
-                # FIX: Reset timer and continue instead of returning/stopping the task
                 if not state.get("awaiting_slack_reply"):
                     elapsed = 0
                     continue
@@ -1145,63 +1184,34 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
 
                 if elapsed >= MAX_WAIT:
                     logger.info(
-                        f"[{client_id}] slack_watcher: no reply after {MAX_WAIT}s, giving up on this reply."
+                        f"[{client_id}] slack_watcher: no reply after {MAX_WAIT}s, giving up."
                     )
                     state["awaiting_slack_reply"] = False
                     elapsed = 0
                     continue
 
-                host_names = state.get("all_hosts") or [
-                    state.get("meeting_with_resolved")
-                    or state.get("sched_employee_name")
-                ]
-                notification_channel = state.get("notification_channel_id", "")
-
-                reply = None
-                reply_source = ""
-
-                # Strategy 1 — exact DB host name match
-                for host_name in host_names:
-                    if not host_name:
-                        continue
-                    reply = _pop_reply(host_name)
-                    if reply:
-                        reply_source = host_name
-                        break
-
-                # Strategy 2 — any reply in the notification channel (Handles Sannidhi replying for Priya)
-                if not reply and notification_channel:
-                    reply = _pop_channel(notification_channel)
-                    if reply:
-                        reply_source = f"#{notification_channel}"
-
-                if not reply:
+                session_id = state.get("session_id")
+                if not session_id:
                     continue
 
-                # ── Reply found — hand off to brain() for full pipeline ────────
-                # ── Reply found — hand off to brain() for full pipeline ────────
+                # Poll Slack API directly — no webhook needed
+                result = await poll_for_reply(session_id)
+                if not result:
+                    continue
+
+                sender_name, reply_text = result
                 elapsed = 0
+
                 logger.info(
-                    f"[{client_id}] slack_watcher REPLY from '{reply_source}': {reply}"
+                    f"[{client_id}] slack_watcher REPLY from '{sender_name}': {reply_text}"
                 )
 
-                # Do NOT set awaiting_slack_reply = False here. Let query_router do it.
-
-                # 1. Interrupt the microphone so the AI can speak immediately!
+                # Interrupt frontend and inject into brain()
                 await websocket.send_json({"type": "interrupt_listening"})
+                await text_queue.put(f"SLACK_REPLY:{sender_name}:{reply_text}")
 
-                # 2. Inject into text_queue — brain() picks it up and runs the full cycle.
-                await text_queue.put(f"SLACK_REPLY:{reply_source}:{reply}")
+            logger.info(f"[{client_id}] slack_watcher exiting.")
 
-            logger.info(
-                f"[{client_id}] slack_watcher: no reply after {MAX_WAIT}s, exiting."
-            )
-
-        # listener() and send_keepalive() drive audio I/O — exit on disconnect/timeout.
-        # brain() and slack_watcher() must outlive them to process queued replies.
-        # Strategy:
-        #   Phase 1 — run all 4 together; stop when listener or keepalive exits (disconnect/timeout)
-        #   Phase 2 — if slack reply is still pending, let brain+watcher finish together
         io_tasks = [
             asyncio.create_task(listener()),
             asyncio.create_task(send_keepalive()),
@@ -1209,14 +1219,11 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
         brain_task = asyncio.create_task(brain())
         watcher_task = asyncio.create_task(slack_watcher())
 
-        # Wait for I/O to finish (visitor left or disconnected)
         await asyncio.wait(io_tasks, return_when=asyncio.FIRST_COMPLETED)
 
-        # Cancel I/O tasks cleanly
         for t in io_tasks:
             t.cancel()
 
-        # If a Slack reply is still in flight, let brain+watcher finish
         from services.query_router import get_session_state as _qs
 
         try:
@@ -1226,16 +1233,12 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
             still_waiting = False
 
         if still_waiting and not brain_task.done() and not watcher_task.done():
-            logger.info(
-                f"[{client_id}] I/O done but Slack reply pending — keeping brain+watcher alive."
-            )
             await asyncio.wait(
                 [brain_task, watcher_task],
                 return_when=asyncio.ALL_COMPLETED,
-                timeout=120,  # hard ceiling 2 min
+                timeout=120,
             )
 
-        # Cancel whatever is left
         brain_task.cancel()
         watcher_task.cancel()
     finally:
