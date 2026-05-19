@@ -1,5 +1,4 @@
 import logging
-import os
 import re
 import uuid
 import asyncio
@@ -23,10 +22,22 @@ from services.notify_slack import (
     clear_session as clear_slack_cache,
 )
 from services.calendar_service import schedule_google_meeting_background
-from services.slack_reply_store import pop_reply
 
 # Logger Configuration
 logger = logging.getLogger(__name__)
+
+
+def _fmt_display(hhmm: str) -> str:
+    """Convert internal 24hr 'HH:MM' to display '12:30 PM' for the LLM and user."""
+    if not hhmm:
+        return hhmm
+    try:
+        dt = datetime.strptime(hhmm, "%H:%M")
+        hour = dt.hour % 12 or 12
+        return f"{hour}:{dt.strftime('%M %p')}"
+    except ValueError:
+        return hhmm
+
 
 # Constants - STRICTLY PRESERVED
 AI_NAME = "Jarvis"
@@ -177,7 +188,6 @@ def _fresh_state() -> Dict[str, Any]:
         "identity_updated": False,
         "notified_hosts": set(),
         "all_hosts": [],  # list of all resolved host names to notify
-        "notification_channel_id": os.getenv("SLACK_NOTIFICATION_CHANNEL_ID", ""),
         "greeted": False,
         "force_admin": False,
         "awaiting_slack_reply": False,
@@ -381,9 +391,7 @@ def _notify_host_pending(state: Dict[str, Any]) -> bool:
             purpose=state.get("sched_purpose") or state.get("purpose") or "Meeting",
             session_id=state["session_id"],
         )
-        send_slack_arrival(
-            host_name, v_name, state["visitor_type"], narrative, state["session_id"]
-        )
+
         state["notified_hosts"].add(host_name)
         state["awaiting_slack_reply"] = True
         return True
@@ -547,9 +555,17 @@ def _merge_checkin_entities(
     # ─────────────────────────────────────────────────────────────────────────
 
     if entities.get("date"):
-        state["sched_date"] = _normalize_date(str(entities["date"]))
+        new_date = _normalize_date(str(entities["date"]))
+        if new_date and new_date != state.get("sched_date"):
+            state["sched_date"] = new_date
+            state["host_preapproved"] = False  # Reset
+
     if entities.get("time"):
-        state["sched_time"] = _normalize_time(str(entities["time"]))
+        new_time = _normalize_time(str(entities["time"]))
+        if new_time and new_time != state.get("sched_time"):
+            state["sched_time"] = new_time
+            state["host_preapproved"] = False  # Reset
+
     if entities.get("purpose"):
         state["purpose"] = state["sched_purpose"] = entities["purpose"]
 
@@ -560,8 +576,13 @@ async def _handle_availability_check(
     target = state.get("meeting_with_resolved") or query
     emp = _lookup_employee(target)
     if emp:
-        slots = get_available_slots(emp.name, datetime.now().strftime("%Y-%m-%d"))
-        slot_str = ", ".join(slots[:3]) if slots else "no more slots today"
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        after_time = datetime.now().strftime("%H:%M")
+        slots = get_available_slots(emp.name, today_str, after_time=after_time)
+        if slots:
+            slot_str = ", ".join(_fmt_display(s) for s in slots[:3])
+        else:
+            slot_str = "no more slots today"
         return await _llm_reply(
             f"Inform them {emp.name} is the {emp.role}. Free slots: {slot_str}.",
             state,
@@ -658,20 +679,119 @@ async def _handle_scheduling(
         return await _llm_reply("Ask for the date.", state, query, client_id)
     if not state.get("sched_time"):
         return await _llm_reply("Ask for the time.", state, query, client_id)
-    slots = get_available_slots(state["sched_employee_name"], state["sched_date"])
-    if state["sched_time"] not in slots:
+
+    # --- NEW: STRICT OFFICE HOURS CHECK ---
+    # If the visitor asks for a time after 19:00 (7:00 PM)
+    if state["sched_time"] > "19:00" and not state.get("host_preapproved"):
+        state["sched_time"] = None  # Clear the invalid time so the AI asks again
         return await _llm_reply(
-            f"Suggest alternate slots: {', '.join(slots[:3])}.", state, query, client_id
+            "Politely inform the visitor that our office hours end at 7:00 PM, "
+            "so meetings cannot be scheduled after this time. Ask them to choose an earlier time.",
+            state,
+            query,
+            client_id,
+        )
+    # --------------------------------------
+
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    after_time = (
+        datetime.now().strftime("%H:%M") if state["sched_date"] == today_str else None
+    )
+    before_time = state.get("sched_time_before")
+
+    host_after = state.get("sched_time_after")
+    if host_after:
+        after_time = max(after_time, host_after) if after_time else host_after
+
+    slots = get_available_slots(
+        state["sched_employee_name"],
+        state["sched_date"],
+        after_time=after_time,
+        before_time=before_time,
+    )
+
+    state.pop("sched_time_before", None)
+    state.pop("sched_time_after", None)
+    # --- 3. NEW: Trust the host's time even if outside normal DB hours ---
+    if state.get("host_preapproved") and state.get("sched_time"):
+        if state["sched_time"] not in slots:
+            slots.append(state["sched_time"])
+            slots.sort()
+
+    if not slots:
+        if before_time and after_time:
+            constraint_desc = (
+                f"between {_fmt_display(after_time)} and {_fmt_display(before_time)}"
+            )
+        elif before_time:
+            constraint_desc = f"before {_fmt_display(before_time)}"
+        elif after_time:
+            constraint_desc = f"after {_fmt_display(after_time)}"
+        else:
+            constraint_desc = "today"
+
+        return await _llm_reply(
+            f"Tell the visitor there are no available slots {constraint_desc}. "
+            f"Ask if they'd like a different day.",
+            state,
+            query,
+            client_id,
+        )
+
+    if state["sched_time"] not in slots:
+        display_slots = [_fmt_display(s) for s in slots[:3]]
+        return await _llm_reply(
+            f"The requested time is unavailable. Suggest these alternate slots: "
+            f"{', '.join(display_slots)}.",
+            state,
+            query,
+            client_id,
         )
     if intent == "confirm" or any(
-        x in query.lower() for x in ["okay", "yes", "correct", "book"]
+        x in query.lower()
+        for x in [
+            "okay",
+            "yes",
+            "correct",
+            "book",
+            "sure",
+            "please",
+            "ok",
+            "do it",
+            "perfect",
+        ]
     ):
-        if _notify_host_pending(state):
+        # --- 4. NEW: Direct booking if host pre-approved ---
+        if state.get("host_preapproved"):
+            _book_calendar_event(state)
+            state["scheduling_active"] = False
+            state["conv_state"] = State.COMPLETED
+            state["host_preapproved"] = False  # Clear state
+
+            host = state["sched_employee_name"]
+            time_disp = _fmt_display(state["sched_time"])
+            return await _llm_reply(
+                f"Tell the visitor their meeting is confirmed with {host} at {time_disp}. Ask them to wait.",
+                state,
+                query,
+                client_id,
+            )
+        # ---------------------------------------------------
+
+        result = _notify_host_pending(state)
+        if result == -1:
+            return await _llm_reply(
+                f"Inform the visitor that the slot at {_fmt_display(state['sched_time'])} is already booked. Ask them to choose another time.",
+                state,
+                query,
+                client_id,
+            )
+        elif result:
             # Keep scheduling_active — session is NOT done yet.
             state["scheduling_active"] = True
             state["awaiting_slack_reply"] = True
             host = state["sched_employee_name"]
-            time = state["sched_time"]
+            time = _fmt_display(state["sched_time"])
             return await _llm_reply(
                 f"Tell the visitor: 'I have notified {host} for {time}. "
                 f"Please give me a moment while I wait for their confirmation.'",
@@ -679,8 +799,16 @@ async def _handle_scheduling(
                 query,
                 client_id,
             )
+        else:
+            return await _llm_reply(
+                "Apologize and say there was an error scheduling the meeting.",
+                state,
+                query,
+                client_id,
+            )
+
     return await _llm_reply(
-        f"Verify meeting with {state['sched_employee_name']} at {state['sched_time']}. Proceed?",
+        f"Ask the visitor to confirm if they want to schedule the meeting with {state['sched_employee_name']} at {_fmt_display(state['sched_time'])}.",
         state,
         query,
         client_id,
@@ -705,12 +833,7 @@ async def route_query(client_id: str, user_query: str) -> str:
             f"I am {AI_NAME}, how can I assist you today?"
         )
 
-    extracted = await llm.extract_intent_and_entities(user_query)
-    intent = extracted.get("intent", "general")
-    entities = extracted.get("entities", {})
-    _merge_checkin_entities(state, entities, user_query)
-
-    # ── CHECK FOR PENDING SLACK REPLY FROM ANY HOST ───────────────────────────
+    # ── 1. MOVED TO TOP: CHECK FOR PENDING SLACK REPLY ────────────────────────
     if user_query.startswith("SLACK_REPLY:"):
         parts = user_query.split(":", 2)
         host_name = parts[1] if len(parts) > 1 else "Host"
@@ -718,7 +841,6 @@ async def route_query(client_id: str, user_query: str) -> str:
 
         state["awaiting_slack_reply"] = False
 
-        # ── Scheduling flow: detect confirm vs counter-proposal ──
         if state.get("scheduling_active"):
             _CONFIRM_KEYWORDS = {
                 "yes",
@@ -742,24 +864,71 @@ async def route_query(client_id: str, user_query: str) -> str:
                 _book_calendar_event(state)
                 state["scheduling_active"] = False
                 state["conv_state"] = State.COMPLETED
+                sched_display = _fmt_display(state.get("sched_time") or "")
                 situation = (
                     f"{host_name} confirmed the meeting. "
                     f"Tell the visitor the meeting is confirmed "
-                    f"with {host_name} at {state.get('sched_time')}."
+                    f"with {host_name} at {sched_display}."
                 )
             else:
-                # Host counter-proposed — keep conversation alive
+                time_match = re.search(
+                    r"\b((?:1[0-2]|0?[1-9])(?::[0-5][0-9])?\s*(?:am|pm)?|(?:[01]?\d|2[0-3]):[0-5][0-9])\b",
+                    slack_reply,
+                    re.IGNORECASE,
+                )
+
+                if time_match:
+                    constraint_time_24 = _normalize_time(time_match.group(1))
+
+                    if constraint_time_24:
+                        reply_lower = slack_reply.lower()
+
+                        # --- 1. NEW: Update date based on Slack reply ---
+                        today_str = datetime.now().strftime("%Y-%m-%d")
+                        tomorrow_str = (datetime.now() + timedelta(days=1)).strftime(
+                            "%Y-%m-%d"
+                        )
+                        if "today" in reply_lower:
+                            state["sched_date"] = today_str
+                        elif "tomorrow" in reply_lower:
+                            state["sched_date"] = tomorrow_str
+                        # ------------------------------------------------
+
+                        before_match = re.search(r"\bbefore\b", reply_lower)
+                        after_match = re.search(r"\b(after|from)\b", reply_lower)
+
+                        if before_match:
+                            state["sched_time_before"] = constraint_time_24
+                            state["sched_time"] = None
+                        elif after_match:
+                            state["sched_time_after"] = constraint_time_24
+                            state["sched_time"] = None
+                        else:
+                            state["sched_time"] = constraint_time_24
+                            # --- 2. NEW: Mark as host pre-approved ---
+                            state["host_preapproved"] = True
+                            # -----------------------------------------
+
+                constraint_desc = ""
+                if state.get("sched_time_before"):
+                    constraint_desc = (
+                        f"before {_fmt_display(state['sched_time_before'])}"
+                    )
+                elif state.get("sched_time_after"):
+                    constraint_desc = f"after {_fmt_display(state['sched_time_after'])}"
+                elif state.get("sched_time"):
+                    constraint_desc = f"at {_fmt_display(state['sched_time'])}"
+
                 situation = (
                     f'{host_name} replied via Slack: "{slack_reply}". '
-                    f"If the host proposed a new time (like 5:30), "
-                    f"ask the visitor if the new time works. "
-                    f"Otherwise relay the message naturally."
+                    f"{'The host proposes a time ' + constraint_desc + '. ' if constraint_desc else ''}"
+                    f"Ask the visitor if this works or relay the message naturally."
                 )
             return await _llm_reply(
                 situation, state, "[System: Slack Reply Received]", client_id
             )
 
-        # ── Non-scheduling flow: just relay ──
+        # Non-scheduling flow
         situation = (
             f"{host_name} replied via Slack with the following message: "
             f'"{slack_reply}". '
@@ -770,22 +939,63 @@ async def route_query(client_id: str, user_query: str) -> str:
         )
     # ─────────────────────────────────────────────────────────────────────────
 
-    # ── rest of the existing routing logic (unchanged) ────────────────────
+    # ── 2. ONLY RUN ENTITY EXTRACTION ON ACTUAL USER SPEECH ──────────────────
+    extracted = await llm.extract_intent_and_entities(user_query)
+    intent = extracted.get("intent", "general")
+    entities = extracted.get("entities", {})
+    _merge_checkin_entities(state, entities, user_query)
+
+    # ... (The rest of your existing route_query logic remains exactly the same below this line) ...
     if any(
         x in query_low for x in ["don't know", "do not know", "anyone", "notify admin"]
     ):
         state["force_admin"] = True
         state["meeting_with_resolved"] = "Administration Team"
 
-    if any(w in query_low for w in ["thank you", "thanks", "bye", "goodbye"]):
-        reply = await _llm_reply(
-            "Give a single warm farewell sentence. Use the visitor's name if you know it. Do NOT list multiple options.",
-            state,
-            user_query,
-            client_id,
-        )
-        clear_session_state(client_id)
-        return reply
+    # ... etc ...
+
+    is_farewell = any(w in query_low for w in ["thank you", "thanks", "bye", "goodbye"])
+    if is_farewell:
+        if state.get("scheduling_active") and not state.get("awaiting_slack_reply"):
+            if any(
+                x in query_low
+                for x in [
+                    "yes",
+                    "okay",
+                    "ok",
+                    "sure",
+                    "please",
+                    "do it",
+                    "correct",
+                    "book",
+                ]
+            ):
+                pass  # Let it fall through to scheduling confirmation
+            else:
+                reply = await _llm_reply(
+                    "Give a single warm farewell sentence. Use the visitor's name if you know it. Do NOT list multiple options.",
+                    state,
+                    user_query,
+                    client_id,
+                )
+                clear_session_state(client_id)
+                return reply
+        elif state.get("awaiting_slack_reply"):
+            return await _llm_reply(
+                "Acknowledge their thanks politely. If they are waiting for a meeting confirmation, remind them you are still waiting for the host's reply. Otherwise, just tell them to have a seat.",
+                state,
+                user_query,
+                client_id,
+            )
+        else:
+            reply = await _llm_reply(
+                "Give a single warm farewell sentence. Use the visitor's name if you know it. Do NOT list multiple options.",
+                state,
+                user_query,
+                client_id,
+            )
+            clear_session_state(client_id)
+            return reply
 
     if any(x in query_low for x in ["free time", "available", "is he free"]):
         return await _handle_availability_check(state, user_query, client_id)
@@ -842,9 +1052,22 @@ async def _llm_reply(
         or state.get("sched_employee_name")
         or "Admin"
     )
+    now = datetime.now()
+    hour = now.hour % 12 or 12
+    now_str = f"{hour}:{now.strftime('%M %p on %A, %d %B %Y')}"
+    time_context = f"[Current time: {now_str}] "
+
     info = f"TALKING TO: {visitor} | HOST: {host} | STATUS: {state['conv_state']}"
     is_first = not state.get("greeted", False)
-    prompt = f"{BASE_SYSTEM_PROMPT}\nKB: {info}\nRULES: {'Greet warmly' if is_first else 'DO NOT greet again'}. GOAL: {situation}\nUSER: {user_query}"
+    prompt = (
+        f"{BASE_SYSTEM_PROMPT}\n"
+        f"KB: {info}\n"
+        f"{time_context}"
+        f"TIME FORMAT RULE: Always say times in 12-hour format with AM/PM (e.g. '1:30 PM', not '13:30').\n"
+        f"RULES: {'Greet warmly' if is_first else 'DO NOT greet again'}. "
+        f"GOAL: {situation}\n"
+        f"USER: {user_query}"
+    )
     resp = await llm.get_raw_response(prompt, client_id=client_id)
     state["greeted"] = True
     return resp

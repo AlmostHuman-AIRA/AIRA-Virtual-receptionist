@@ -76,12 +76,11 @@ async def test_challenge(request: Request):
 from routes.api_routes import router as api_router
 from routes.websocket_routes import router as websocket_router
 from routes.employee_routes import router as employee_router
-from routes.slack_webhook_receiver import router as slack_router
 
 app.include_router(api_router)
 app.include_router(websocket_router)
 app.include_router(employee_router, prefix="/api")
-app.include_router(slack_router)
+# app.include_router(slack_router)
 
 
 def main():
