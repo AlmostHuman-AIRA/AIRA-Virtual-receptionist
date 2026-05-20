@@ -31,11 +31,10 @@ dependencies = [
     "openwakeword",
     "silero-vad",
     "deepface>=0.0.93",
-    "tf-keras",                       # Required for newer DeepFace/TF compatibility
     "python-dotenv",                  # For load_dotenv()
     "mtcnn",                          # Required for FACE_VERIFY_DETECTOR=mtcnn
-    "tensorflow==2.15.1",             # 2.15.1 = last version with win_amd64 wheel for tensorflow-io-gcs-filesystem
-    "opencv-python-headless",         # Safer for server environments (avoids libGL errors)
+    "tensorflow==2.15.1",             # 2.15.1 = last version with win_amd64 wheel
+    "opencv-python-headless",         # Safer for server environments
     "mediapipe==0.10.14",             # Face detection for presence-based activation
 ]
 
