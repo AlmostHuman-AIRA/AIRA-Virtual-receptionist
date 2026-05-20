@@ -48,11 +48,6 @@ def unregister_thread(session_id: str) -> None:
 
 
 async def poll_for_reply(session_id: str) -> Optional[tuple[str, str]]:
-    """
-    Polls Slack for new replies in the registered thread.
-    Returns (sender_display_name, reply_text) if a new human reply is found.
-    Returns None if nothing new yet.
-    """
     if not SLACK_BOT_TOKEN:
         logger.error("POLLER | SLACK_BOT_TOKEN not set")
         return None
@@ -66,31 +61,45 @@ async def poll_for_reply(session_id: str) -> Optional[tuple[str, str]]:
     thread_ts = entry["thread_ts"]
     last_seen_ts = entry["last_seen_ts"]
 
+    # ✅ DM channels (D...) don't support threads — use conversations.history instead
+    is_dm = channel.startswith("D")
+
     try:
         async with httpx.AsyncClient() as client:
-            resp = await client.get(
-                "https://slack.com/api/conversations.replies",
-                params={
-                    "channel": channel,
-                    "ts": thread_ts,
-                    "oldest": last_seen_ts,  # only fetch messages after what we've seen
-                    "limit": 10,
-                },
-                headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
-                timeout=5,
-            )
+            if is_dm:
+                resp = await client.get(
+                    "https://slack.com/api/conversations.history",
+                    params={
+                        "channel": channel,
+                        "oldest": last_seen_ts,  # only fetch messages after last seen
+                        "limit": 10,
+                    },
+                    headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
+                    timeout=5,
+                )
+            else:
+                resp = await client.get(
+                    "https://slack.com/api/conversations.replies",
+                    params={
+                        "channel": channel,
+                        "ts": thread_ts,
+                        "oldest": last_seen_ts,
+                        "limit": 10,
+                    },
+                    headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
+                    timeout=5,
+                )
             data = resp.json()
 
         if not data.get("ok"):
-            logger.warning("POLLER | Slack API error: %s", data.get("error"))
+            logger.warning(
+                "POLLER | Slack API error: %s (channel=%s)", data.get("error"), channel
+            )
             return None
 
         messages = data.get("messages", [])
         for msg in messages:
             msg_ts = msg.get("ts", "")
-            # Skip the original bot message (same ts as thread_ts)
-            # Skip anything we've already seen
-            # Skip bot messages (subtype = bot_message or bot_id present)
             if msg_ts <= last_seen_ts:
                 continue
             if msg.get("subtype") == "bot_message" or msg.get("bot_id"):
@@ -98,7 +107,6 @@ async def poll_for_reply(session_id: str) -> Optional[tuple[str, str]]:
             if not msg.get("text", "").strip():
                 continue
 
-            # New human reply found — update cursor and return it
             entry["last_seen_ts"] = msg_ts
             sender = await _get_display_name(msg.get("user", ""))
             reply_text = msg["text"].strip()
@@ -131,6 +139,13 @@ async def _get_display_name(user_id: str) -> str:
             if data.get("ok"):
                 p = data["user"]["profile"]
                 return p.get("display_name") or p.get("real_name", user_id)
+            else:
+                logger.error(
+                    "POLLER | Slack API error for user %s: %s",
+                    user_id,
+                    data.get("error"),
+                )
+                return user_id
     except Exception as e:
         logger.error("POLLER | name lookup failed for %s: %s", user_id, e)
     return user_id

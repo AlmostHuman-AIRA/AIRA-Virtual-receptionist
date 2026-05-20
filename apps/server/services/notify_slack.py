@@ -115,43 +115,157 @@ def send_slack_arrival(
 
 
 def send_slack_meeting_scheduled(
-    host_name, host_email, visitor_name, date_str, time_str, purpose, session_id
+    host_name,
+    host_email,
+    visitor_name,
+    date_str,
+    time_str,
+    purpose,
+    session_id,
+    host_slack_user_id: str | None = None,  # <-- add this
 ):
     with _notify_lock:
         key = f"meeting_{session_id}"
-        # Include time in the value so rescheduled times are NOT blocked
         new_value = f"{visitor_name}_{date_str}_{time_str}"
+        is_reschedule = key in _last_notified and _last_notified.get(key) != new_value
+
         if _last_notified.get(key) == new_value:
             logger.warning(
                 f"Blocking duplicate meeting notification for {visitor_name}"
             )
             return
-        _last_notified[key] = new_value  # store time-aware key
+        _last_notified[key] = new_value
 
     def _send():
-        message = (
-            f"📅 *New Meeting Scheduled via AIRA*\n"
-            f"• *Host:* {host_name} ({host_email})\n"
-            f"• *Visitor:* {visitor_name}\n"
-            f"• *Date:* {date_str}  |  *Time:* {time_str}\n"
-            f"• *Purpose:* {purpose}\n\n"
-            f"_A Google Calendar invite with email has been sent to the host._"
-        )
-        data = _post_message(message)
-        if data:
-            from services.slack_reply_poller import register_thread
+        if is_reschedule:
+            if host_slack_user_id:
+                # ✅ DM path
+                message = (
+                    f"🔄 *Meeting Rescheduled*\n"
+                    f"• *Visitor:* {visitor_name}\n"
+                    f"• *New Date:* {date_str}  |  *New Time:* {time_str}\n"
+                    f"• *Purpose:* {purpose}\n\n"
+                    f"_Visitor has agreed to the new time._"
+                )
+                data = _post_dm(host_slack_user_id, message)
+                if data:
+                    from services.slack_reply_poller import register_thread
 
-            register_thread(
-                session_id=session_id,
-                channel_id=data["channel"],
-                thread_ts=data["ts"],
+                    register_thread(
+                        session_id=session_id,
+                        channel_id=data["channel"],
+                        thread_ts=data["ts"],
+                    )
+                    logger.info(
+                        f"✅ Reschedule DM sent to {host_name} | thread_ts={data['ts']}"
+                    )
+            else:
+                # Fallback: DM failed, post to channel with reschedule label
+                logger.warning(
+                    f"host_slack_user_id missing — falling back to channel for reschedule"
+                )
+                message = (
+                    f"🔄 *Meeting Rescheduled via AIRA*\n"
+                    f"• *Host:* {host_name} ({host_email})\n"
+                    f"• *Visitor:* {visitor_name}\n"
+                    f"• *New Date:* {date_str}  |  *New Time:* {time_str}\n"
+                    f"• *Purpose:* {purpose}\n\n"
+                    f"_Visitor agreed to the updated time._"
+                )
+                data = _post_message(message)
+                if data:
+                    from services.slack_reply_poller import register_thread
+
+                    register_thread(
+                        session_id=session_id,
+                        channel_id=data["channel"],
+                        thread_ts=data["ts"],
+                    )
+
+        else:
+            # ✅ First notification → post to channel as before
+            message = (
+                f"📅 *New Meeting Scheduled via AIRA*\n"
+                f"• *Host:* {host_name} ({host_email})\n"
+                f"• *Visitor:* {visitor_name}\n"
+                f"• *Date:* {date_str}  |  *Time:* {time_str}\n"
+                f"• *Purpose:* {purpose}\n\n"
+                f"_A Google Calendar invite with email has been sent to the host._"
             )
-            logger.info(
-                f"✅ Meeting notification sent for {visitor_name} with {host_name} | "
-                f"thread_ts={data['ts']}"
-            )
+            data = _post_message(message)
+            if data:
+                from services.slack_reply_poller import register_thread
+
+                register_thread(
+                    session_id=session_id,
+                    channel_id=data["channel"],
+                    thread_ts=data["ts"],
+                )
+                logger.info(
+                    f"✅ Meeting notification sent for {visitor_name} with {host_name} | thread_ts={data['ts']}"
+                )
 
     _executor.submit(_send)
+
+
+def get_slack_user_id_by_email(email: str) -> str | None:
+    """Look up a Slack user ID by their email address."""
+    try:
+        response = httpx.get(
+            "https://slack.com/api/users.lookupByEmail",
+            headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
+            params={"email": email},
+            timeout=10,
+        )
+        data = response.json()
+        if data.get("ok"):
+            return data["user"]["id"]
+        logger.error("users.lookupByEmail failed: %s", data.get("error"))
+        return None
+    except Exception as e:
+        logger.error("users.lookupByEmail exception: %s", e)
+        return None
+
+
+def _get_dm_channel(user_id: str) -> str | None:
+    """Open a DM channel with a user and return the channel ID."""
+    try:
+        response = httpx.post(
+            "https://slack.com/api/conversations.open",
+            headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
+            json={"users": user_id},
+            timeout=10,
+        )
+        data = response.json()
+        if data.get("ok"):
+            return data["channel"]["id"]
+        logger.error("conversations.open failed: %s", data.get("error"))
+        return None
+    except Exception as e:
+        logger.error("conversations.open exception: %s", e)
+        return None
+
+
+def _post_dm(user_id: str, text: str) -> dict | None:
+    """Send a DM to a specific user."""
+    dm_channel = _get_dm_channel(user_id)
+    if not dm_channel:
+        return None
+    try:
+        response = httpx.post(
+            "https://slack.com/api/chat.postMessage",
+            headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
+            json={"channel": dm_channel, "text": text},
+            timeout=10,
+        )
+        data = response.json()
+        if not data.get("ok"):
+            logger.error("DM postMessage failed: %s", data.get("error"))
+            return None
+        return data
+    except Exception as e:
+        logger.error("DM postMessage exception: %s", e)
+        return None
 
 
 def clear_session(session_id: str):

@@ -19,6 +19,7 @@ from models.groq_processor import BASE_SYSTEM_PROMPT, GroqProcessor
 from services.notify_slack import (
     send_slack_arrival,
     send_slack_meeting_scheduled,
+    get_slack_user_id_by_email,
     clear_session as clear_slack_cache,
 )
 from services.calendar_service import schedule_google_meeting_background
@@ -382,14 +383,17 @@ def _notify_host_pending(state: Dict[str, Any]) -> bool:
         )
         db.add(log)
         db.commit()
+        host_email = state.get("sched_employee_email", "")
+        host_slack_user_id = get_slack_user_id_by_email(host_email)
         send_slack_meeting_scheduled(
             host_name=host_name,
-            host_email=state.get("sched_employee_email", ""),
+            host_email=host_email,
             visitor_name=v_name,
             date_str=state["sched_date"],
             time_str=state["sched_time"],
             purpose=state.get("sched_purpose") or state.get("purpose") or "Meeting",
             session_id=state["session_id"],
+            host_slack_user_id=host_slack_user_id,
         )
 
         state["notified_hosts"].add(host_name)
@@ -738,15 +742,27 @@ async def _handle_scheduling(
             client_id,
         )
 
+    # In _handle_scheduling, around line 746
+    logger.info(f"DEBUG slots={slots} sched_time={state['sched_time']}")
+
     if state["sched_time"] not in slots:
-        display_slots = [_fmt_display(s) for s in slots[:3]]
-        return await _llm_reply(
-            f"The requested time is unavailable. Suggest these alternate slots: "
-            f"{', '.join(display_slots)}.",
-            state,
-            query,
-            client_id,
-        )
+        # Only suggest alternatives if NOT already confirmed by visitor
+        if any(
+            x in query.lower()
+            for x in ["okay", "yes", "ok", "sure", "do it", "agreed", "that time"]
+        ):
+            # Visitor is confirming — trust the time, add it to slots
+            slots.append(state["sched_time"])
+        else:
+            display_slots = [_fmt_display(s) for s in slots[:3]]
+            return await _llm_reply(
+                f"The requested time is unavailable. Suggest these alternate slots: "
+                f"{', '.join(display_slots)}.",
+                state,
+                query,
+                client_id,
+            )
+
     if intent == "confirm" or any(
         x in query.lower()
         for x in [
@@ -825,6 +841,11 @@ async def route_query(client_id: str, user_query: str) -> str:
 
     # Wake word → fresh session
     if any(x in query_low for x in WAKE_WORDS):
+        # --- NEW: Ignore wake word resets if waiting for Slack ---
+        if state.get("awaiting_slack_reply"):
+            return "I am still waiting for the host to reply. Please give me just a moment."
+        # ---------------------------------------------------------
+
         clear_session_state(client_id)
         state = get_session_state(client_id)
         state["greeted"] = True

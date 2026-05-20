@@ -45,7 +45,7 @@ def seed_database():
             ),
             Employee(
                 name="Arjun",
-                email="sannidhivk2004+arjun@gmail.com",
+                email="sannidhivk15+arjun@gmail.com",
                 department="Engineering",
                 role="Lead Engineer",
                 location="Floor 3, Desk 35",
@@ -63,7 +63,7 @@ def seed_database():
             ),
             Employee(
                 name="Jack",
-                email="sannidhivk2004+sannidhi@gmail.com",
+                email="sannidhivk15+sannidhi@gmail.com",
                 department="Sales",
                 role="Sales Director",
                 location="Floor 1, Room 105",
@@ -72,7 +72,7 @@ def seed_database():
             ),
             Employee(
                 name="john",
-                email="krutikakanchani847+lavanya@gmail.com",
+                email="krutikakanchani847+john@gmail.com",
                 department="IT Support",
                 role="IT Administrator",
                 location="Floor 1, Tech Bar",
@@ -81,7 +81,7 @@ def seed_database():
             ),
             Employee(
                 name="Virat",
-                email="krutikaak07+sunil@gmail.com",
+                email="krutikaak07+virat@gmail.com",
                 department="Design",
                 role="UX/UI Designer",
                 location="Floor 2, Creative Studio",
@@ -90,7 +90,7 @@ def seed_database():
             ),
             Employee(
                 name="Ravi",
-                email="sannidhivk2004+prajwal@gmail.com",
+                email="sannidhivk15+ravi@gmail.com",
                 department="Finance",
                 role="Chief Financial Officer",
                 location="Floor 5, Room 502",
@@ -99,7 +99,7 @@ def seed_database():
             ),
             Employee(
                 name="Rahul",
-                email="sannidhivk2004+rahul@gmail.com",
+                email="sannidhivk15+rahul@gmail.com",
                 department="Marketing",
                 role="Marketing Coordinator",
                 location="Floor 2, Desk 12",
@@ -108,7 +108,7 @@ def seed_database():
             ),
             Employee(
                 name="Ramesh",
-                email="sannidhivk2004+pratham@gmail.com",
+                email="sannidhivk15+ramesh@gmail.com",
                 department="Engineering",
                 role="Data Scientist",
                 location="Floor 3, Desk 42",
@@ -126,7 +126,7 @@ def seed_database():
             ),
             Employee(
                 name="Cookie",
-                email="krutikakanchani847+vivek@gmail.com",
+                email="krutikakanchani847+cookie@gmail.com",
                 department="Finance",
                 role="Accountant",
                 location="Floor 4, Desk 8",
@@ -135,7 +135,7 @@ def seed_database():
             ),
             Employee(
                 name="Jim",
-                email="krutikaak07+veeresh@gmail.com",
+                email="krutikaak07+ jim@gmail.com",
                 department="Operations",
                 role="Operations Manager",
                 location="Floor 1, Room 112",

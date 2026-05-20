@@ -2772,7 +2772,6 @@ dependencies = [
     { name = "soundfile" },
     { name = "sqlalchemy" },
     { name = "tensorflow" },
-    { name = "tf-keras" },
     { name = "torch" },
     { name = "torchaudio" },
     { name = "uvicorn" },
@@ -2814,7 +2813,6 @@ requires-dist = [
     { name = "soundfile", specifier = "==0.13.1" },
     { name = "sqlalchemy", specifier = ">=2.0.0" },
     { name = "tensorflow", specifier = "==2.15.1" },
-    { name = "tf-keras" },
     { name = "torch", specifier = "==2.5.1+cu124" },
     { name = "torchaudio", specifier = "==2.5.1+cu124" },
     { name = "uvicorn", specifier = ">=0.34.3" },
@@ -2915,18 +2913,6 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/46/79/cf31d7a93a8fdc6aa0fbb665be84426a8c5a557d9240b6239e9e11e35fc5/termcolor-3.3.0.tar.gz", hash = "sha256:348871ca648ec6a9a983a13ab626c0acce02f515b9e1983332b17af7979521c5", size = 14434, upload-time = "2025-12-29T12:55:21.882Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/33/d1/8bb87d21e9aeb323cc03034f5eaf2c8f69841e40e4853c2627edf8111ed3/termcolor-3.3.0-py3-none-any.whl", hash = "sha256:cf642efadaf0a8ebbbf4bc7a31cec2f9b5f21a9f726f4ccbb08192c9c26f43a5", size = 7734, upload-time = "2025-12-29T12:55:20.718Z" },
-]
-
-[[package]]
-name = "tf-keras"
-version = "2.15.1"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "tensorflow" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/03/a3/72e49c210fe545159c98842f110f024195f8efefc2e310f8eac77e3d599e/tf_keras-2.15.1.tar.gz", hash = "sha256:40ab605cecc7759c657cb2bccd9efaacd6fc2369a6c1eba8053890afeac46886", size = 1251021, upload-time = "2024-03-08T18:37:50.084Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/6f/23/6fd9aab5b7ef9e5614b94edce48d92db9d38d2bd2d00ef2c7a6f82a00588/tf_keras-2.15.1-py3-none-any.whl", hash = "sha256:8beaef46b8b4f1158de1410e7c0cf82f008b9e8c4ab3443f54ac1aaef9c2ad74", size = 1715031, upload-time = "2024-03-08T18:37:47.562Z" },
 ]
 
 [[package]]
