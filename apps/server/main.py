@@ -31,6 +31,8 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:3000",
         "http://127.0.0.1:3000",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -74,12 +76,16 @@ from routes.websocket_routes import router as websocket_router
 from routes.employee_routes import (
     router as employee_router,
 )  # Employee photo upload API
+from routes.dashboard_routes import router as dashboard_router  # Dashboard API
 
 app.include_router(api_router)
 app.include_router(websocket_router)
 app.include_router(
     employee_router, prefix="/api"
 )  # Registers GET/POST /api/employees/*
+app.include_router(
+    dashboard_router, prefix="/api/dashboard"
+)  # Registers GET/POST /api/dashboard/*
 
 
 def main():

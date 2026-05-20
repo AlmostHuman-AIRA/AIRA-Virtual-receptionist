@@ -43,7 +43,7 @@ class KokoroTTSProcessor:
             # Set voice to the local file we downloaded
             # This safely gets the path to apps/server/voices/af_sarah.pt
             base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            local_voice_path = os.path.join(base_dir, "voices", "af_sarah.pt")
+            local_voice_path = os.path.join(base_dir, "voices", "af_bella.pt")
 
             if os.path.exists(local_voice_path):
                 self.default_voice = local_voice_path
