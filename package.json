@@ -4,9 +4,10 @@
 	"description": "",
 	"scripts": {
 		"monorepo-setup": "pnpm install && pnpm --filter @talkmateai/server exec uv sync",
-		"dev": "concurrently \"pnpm run dev:client\" \"pnpm run dev:server\"",
+		"dev": "concurrently \"pnpm run dev:client\" \"pnpm run dev:server\" \"pnpm run dev:dashboard\"",
 		"dev:client": "pnpm --filter @talkmateai/client dev",
 		"dev:server": "pnpm --filter @talkmateai/server dev",
+		"dev:dashboard": "pnpm --filter @talkmateai/dashboard dev",
 		"build": "pnpm -r build",
 		"prepare": "husky",
 		"format": "pnpm run format:client && pnpm run format:server",

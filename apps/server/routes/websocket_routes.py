@@ -440,7 +440,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
 
                             # Cooldown: skip if we triggered recently (prevent rapid re-activation)
                             PRESENCE_FRAME_COOLDOWN = float(
-                                os.getenv("PRESENCE_FRAME_COOLDOWN", "5.0")
+                                os.getenv("PRESENCE_FRAME_COOLDOWN", "9.0")
                             )
                             if (
                                 time.time() - session_state["last_presence_trigger"]
