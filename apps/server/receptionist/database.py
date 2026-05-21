@@ -394,20 +394,24 @@ def get_employee_by_name(name: str) -> Optional[Employee]:
 
         row = public.filter(
             or_(
-                Employee.name.ilike(f"%{name_clean}%"),
+                Employee.name.ilike(f"% {name_clean}%"),
                 Employee.name.ilike(f"{name_clean}%"),
             )
         ).first()
         if row:
             return row
 
+        # Use a strict 0.85 cutoff (85% similarity)
         all_employees = public.all()
         emp_names = [e.name for e in all_employees]
-        matches = difflib.get_close_matches(name_clean, emp_names, n=1, cutoff=0.6)
+        matches = difflib.get_close_matches(name_clean, emp_names, n=1, cutoff=0.85)
         if matches:
-            for emp in all_employees:
-                if emp.name == matches[0]:
-                    return emp
+            # Confirm that we aren't matching words with completely different prefix sounds
+            matched_name = matches[0].lower()
+            if abs(len(name_clean) - len(matched_name)) <= 2:
+                for emp in all_employees:
+                    if emp.name == matches[0]:
+                        return emp
         return None
     except Exception as exc:
         logger.error("get_employee_by_name failed: %s", exc)
