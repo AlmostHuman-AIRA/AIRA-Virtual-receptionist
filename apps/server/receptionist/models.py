@@ -27,6 +27,8 @@ class Employee(Base):
     reports_to = Column(Integer, ForeignKey("employees.id"), nullable=True)
     is_public = Column(Boolean, default=True)
     photo_path = Column(String)
+    slack_user_id = Column(String, nullable=True)  # ← add this
+    slack_dm_channel = Column(String, nullable=True)  # ← add this
 
     # Relationships
     manager = relationship("Employee", remote_side=[id], backref="subordinates")

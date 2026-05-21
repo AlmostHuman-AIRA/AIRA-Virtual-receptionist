@@ -347,8 +347,6 @@ def _lookup_employee(search_term: str) -> Optional[Employee]:
 
 
 def _notify_host_pending(state: Dict[str, Any]) -> bool:
-    """Create the DB ReceptionLog and fire a Slack notification.
-    Does NOT book the Google Calendar — that waits for host confirmation."""
     db = SessionLocal()
     try:
         v_name = state.get("visitor_name") or "Guest"
@@ -383,7 +381,15 @@ def _notify_host_pending(state: Dict[str, Any]) -> bool:
         )
         db.add(log)
         db.commit()
-        host_email = state.get("sched_employee_email", "")
+        # ── FIX: Always fetch host email from DB, never trust state ──
+        db_emp = db.query(Employee).filter(Employee.name.ilike(host_name)).first()
+        host_email = (
+            db_emp.email
+            if db_emp and db_emp.email
+            else state.get("sched_employee_email", "")
+        )
+        # ─────────────────────────────────────────────────────────────
+
         host_slack_user_id = get_slack_user_id_by_email(host_email)
         send_slack_meeting_scheduled(
             host_name=host_name,
@@ -641,21 +647,35 @@ async def _finalize_checkin_and_respond(state, query, client_id):
         all_hosts = [fallback]
         state["all_hosts"] = all_hosts
 
+    # AFTER
     newly_notified: List[str] = []
-    for host in all_hosts:
-        if host not in state["notified_hosts"]:
-            send_slack_arrival(
-                host,
-                state["visitor_name"],
-                state["visitor_type"],
-                state.get("purpose", "Arrival"),
-                state["session_id"],
-            )
-            state["notified_hosts"].add(host)
-            newly_notified.append(host)
-            logger.info(
-                f"Slack notification sent to '{host}' for visitor '{state['visitor_name']}'"
-            )
+    db = SessionLocal()
+    try:
+        for host in all_hosts:
+            if host not in state["notified_hosts"]:
+                # Look up the employee's Slack user ID from DB
+                db_emp = db.query(Employee).filter(Employee.name.ilike(host)).first()
+                host_slack_user_id = (
+                    db_emp.slack_user_id
+                    if db_emp and hasattr(db_emp, "slack_user_id")
+                    else None
+                )
+
+                send_slack_arrival(
+                    host,
+                    state["visitor_name"],
+                    state["visitor_type"],
+                    state.get("purpose", "Arrival"),
+                    state["session_id"],
+                    host_slack_user_id=host_slack_user_id,  # ← new
+                )
+                state["notified_hosts"].add(host)
+                newly_notified.append(host)
+                logger.info(
+                    f"Slack notification sent to '{host}' for visitor '{state['visitor_name']}'"
+                )
+    finally:
+        db.close()
 
     if newly_notified:
         state["awaiting_slack_reply"] = True
