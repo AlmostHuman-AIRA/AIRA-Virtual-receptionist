@@ -460,26 +460,9 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                             loop = asyncio.get_event_loop()
                             result = await loop.run_in_executor(
                                 _face_executor,
-                                lambda: verify_person_face(
-                                    person_type=person_type,
-                                    audio_name=audio_name,
-                                    image_b64=image_b64,
-                                ),
-                            )
-                            mark_employee_from_face_result(
-                                client_id, result.get("verified", False)
+                                lambda: detection_service.detect_person(image_b64),
                             )
 
-                            session_state["face_verify_in_progress"] = False
-                            if result.get("verified"):
-                                session_state["is_verified"] = True
-                                session_state["verified_name"] = audio_name
-                                session_state["pending_identity_name"] = None
-                                followup_entered_at = time.time()
-                            elif person_type == "employee":
-                                session_state["is_verified"] = False
-                                session_state["pending_identity_name"] = audio_name
-                                followup_entered_at = time.time()
                             if result["detected"]:
                                 session_state["presence_count"] += 1
                                 logger.info(
@@ -488,7 +471,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                 )
 
                                 PRESENCE_CONFIRM_FRAMES = int(
-                                    os.getenv("PRESENCE_CONFIRM_FRAMES", "2")
+                                    os.getenv("PRESENCE_CONFIRM_FRAMES", "3")
                                 )
                                 if (
                                     session_state["presence_count"]
@@ -562,7 +545,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                 result = await loop.run_in_executor(
                                     _face_executor,
                                     lambda: verify_person_face(
-                                        person_type="visitor",
+                                        person_type="person_type",
                                         audio_name=audio_name,
                                         image_b64=image_b64,
                                     ),
@@ -640,6 +623,10 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                     image_b64=image_b64,
                                 ),
                             )
+                            mark_employee_from_face_result(
+                                client_id, result.get("verified", False)
+                            )
+
                             session_state["face_verify_in_progress"] = False
                             if result.get("verified"):
                                 session_state["is_verified"] = True
