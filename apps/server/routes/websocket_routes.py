@@ -336,6 +336,8 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
         "mode": "PASSIVE",
         "awaiting_face": False,
         "is_verified": False,
+        "verified_name": None,
+        "claimed_name": None,
         "visitor_reference_image_b64": None,
         "pending_identity_name": None,
         "person_type": "employee",
@@ -403,6 +405,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                     )  # reset so next session can't inherit a stale clock
                     session_state["is_verified"] = False
                     session_state["verified_name"] = None  # <--- ADD THIS
+                    session_state["claimed_name"] = None
                     session_state["visitor_reference_image_b64"] = None
                     session_state["visitor_captured"] = False  # ← ADD THIS
                     session_state["pending_identity_name"] = None
@@ -545,7 +548,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                 result = await loop.run_in_executor(
                                     _face_executor,
                                     lambda: verify_person_face(
-                                        person_type="person_type",
+                                        person_type=person_type,
                                         audio_name=audio_name,
                                         image_b64=image_b64,
                                     ),
@@ -638,11 +641,27 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                 # (it was parked at +3600 while we waited for the camera frame)
                                 followup_entered_at = time.time()
                             elif person_type == "employee":
+                                result["message"] = (
+                                    f"I wasn't able to verify you as {audio_name} from our employee records. "
+                                    f"I'll check you in as a visitor — could you let me know who you're here to meet?"
+                                )
                                 session_state["is_verified"] = False
-                                session_state["pending_identity_name"] = audio_name
-                                # Restart the clock even on mismatch so the user gets a
-                                # chance to hear the rejection message and try again
+                                # Name matched an employee but face didn't — treat as visitor
+                                # mark_employee_from_face_result already set is_employee=False in query_router state
+                                # Now flip this session to visitor mode so the visitor flow takes over
+                                session_state["person_type"] = "visitor"
+                                session_state["pending_identity_name"] = None
+                                session_state["claimed_name"] = (
+                                    audio_name  # <--- ADD THIS   # stop re-asking for face
+                                )
+                                session_state["visitor_captured"] = (
+                                    False  # allow visitor photo capture
+                                )
                                 followup_entered_at = time.time()
+                                logger.info(
+                                    f"[{client_id}] Employee face mismatch for '{audio_name}' — "
+                                    f"switching to visitor flow."
+                                )
 
                             logger.info(
                                 f"[{client_id}] Face verify result for '{audio_name}': "
@@ -1060,9 +1079,17 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                 else:
                     # --- INJECT USER IDENTITY INTO LLM PROMPT ---
                     verified_name = session_state.get("verified_name")
+                    claimed_name = session_state.get("claimed_name")
+
                     if verified_name:
                         # Secretly tell the LLM who is speaking
                         prompt_text = f"[System Note: The user speaking is verified as {verified_name}] {text}"
+                    elif claimed_name:
+                        prompt_text = (
+                            f"[System Note: The user previously identified themselves as {claimed_name}. "
+                            f"Face verification failed, so they are being checked in as a visitor. "
+                            f"DO NOT ask for their name again; refer to them as {claimed_name}.] {text}"
+                        )
                     else:
                         prompt_text = text
 
