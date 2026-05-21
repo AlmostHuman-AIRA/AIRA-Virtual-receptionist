@@ -26,6 +26,10 @@ from services.person_detection_service import (
     get_person_detection_service,
     warmup_mediapipe,
 )
+from services.query_router import (
+    clear_session_state,
+    mark_employee_from_face_result,  # <--- ADD THIS IMPORT
+)
 
 # Thread pool for running blocking DeepFace and MediaPipe calls without blocking the async event loop.
 _face_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="deepface")
@@ -323,7 +327,6 @@ def create_wav_from_pcm(pcm_bytes: bytes, sample_rate: int = SAMPLE_RATE) -> byt
 @router.websocket("/ws/{client_id}")
 async def websocket_endpoint(websocket: WebSocket, client_id: str):
     await manager.connect(websocket, client_id)
-    from services.query_router import clear_session_state
 
     clear_session_state(client_id)
     whisper_processor = WhisperProcessor.get_instance()
@@ -457,9 +460,26 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                             loop = asyncio.get_event_loop()
                             result = await loop.run_in_executor(
                                 _face_executor,
-                                lambda: detection_service.detect_person(image_b64),
+                                lambda: verify_person_face(
+                                    person_type=person_type,
+                                    audio_name=audio_name,
+                                    image_b64=image_b64,
+                                ),
+                            )
+                            mark_employee_from_face_result(
+                                client_id, result.get("verified", False)
                             )
 
+                            session_state["face_verify_in_progress"] = False
+                            if result.get("verified"):
+                                session_state["is_verified"] = True
+                                session_state["verified_name"] = audio_name
+                                session_state["pending_identity_name"] = None
+                                followup_entered_at = time.time()
+                            elif person_type == "employee":
+                                session_state["is_verified"] = False
+                                session_state["pending_identity_name"] = audio_name
+                                followup_entered_at = time.time()
                             if result["detected"]:
                                 session_state["presence_count"] += 1
                                 logger.info(
