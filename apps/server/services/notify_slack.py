@@ -54,14 +54,55 @@ def _post_message(text: str) -> dict | None:
         return None
 
 
+# ── notify_slack.py (fixed) ──────────────────────────────────────────────────
+
+
+def _get_employee_slack_info(employee_name: str) -> tuple[str | None, str | None]:
+    """
+    Look up slack_user_id and slack_dm_channel from the employees DB by name.
+    Returns (slack_user_id, slack_dm_channel) or (None, None).
+    """
+    import sqlite3
+    from pathlib import Path
+
+    DB_PATH = Path(
+        r"C:/Users/Administrator/Desktop/CPU-compatible-AI-/apps/server/receptionist/office.db"
+    )
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        row = conn.execute(
+            "SELECT slack_user_id, slack_dm_channel FROM employees WHERE name = ?",
+            (employee_name,),
+        ).fetchone()
+        conn.close()
+        if row and row[0]:
+            return row[0], row[1]
+    except Exception as e:
+        logger.error("DB lookup failed for %s: %s", employee_name, e)
+    return None, None
+
+
 def _send_arrival_thread(
     employee_name: str,
     visitor_name: str,
     visitor_type: str,
     purpose: str,
     session_id: str,
+    host_slack_user_id: str | None = None,
 ):
     logger.info(f"Slack thread started for {visitor_name} -> {employee_name}")
+
+    # ── FIX: look up from DB if not passed in ────────────────────────────────
+    if not host_slack_user_id:
+        host_slack_user_id, cached_dm_channel = _get_employee_slack_info(employee_name)
+        if host_slack_user_id:
+            logger.info(
+                f"Resolved slack_user_id for {employee_name} from DB: {host_slack_user_id}"
+            )
+        else:
+            logger.warning(
+                f"No slack_user_id in DB for {employee_name} — will fall back to channel"
+            )
 
     message = (
         f"🛎️ *Visitor Arrival for {employee_name}*\n"
@@ -71,20 +112,35 @@ def _send_arrival_thread(
         f"_Please head to the front desk._"
     )
 
-    data = _post_message(message)
-    if data:
-        # Register the thread so slack_watcher can poll for replies
+    data = None
+
+    # ── Try DM first ─────────────────────────────────────────────────────────
+    if host_slack_user_id:
+        data = _post_dm(host_slack_user_id, message)
+        if data:
+            logger.info(f"✅ Arrival DM sent to {employee_name}")
+        else:
+            logger.warning(f"DM failed for {employee_name} — falling back to channel")
+
+    # ── ALSO post to channel (so reception desk sees it too) ─────────────────
+    channel_message = message + f"\n_Host: {employee_name}_"
+    channel_data = _post_message(channel_message)
+
+    # ── Register thread — prefer DM thread, fall back to channel thread ──────
+    final_data = data or channel_data
+    if final_data:
         from services.slack_reply_poller import register_thread
 
         register_thread(
             session_id=session_id,
-            channel_id=data["channel"],  # actual channel ID confirmed by Slack
-            thread_ts=data["ts"],  # this message's ts = thread anchor
+            channel_id=final_data["channel"],
+            thread_ts=final_data["ts"],
         )
         logger.info(
-            f"✅ Slack notification sent for {employee_name} | "
-            f"channel={data['channel']} thread_ts={data['ts']}"
+            f"✅ Registered thread | channel={final_data['channel']} ts={final_data['ts']}"
         )
+    else:
+        logger.error(f"❌ Both DM and channel post failed for {employee_name}")
 
 
 def send_slack_arrival(
@@ -93,6 +149,7 @@ def send_slack_arrival(
     visitor_type: str,
     purpose: str,
     session_id: str,
+    host_slack_user_id: str | None = None,  # ← add this
 ):
     """Submit arrival notification; deduplicate per session."""
     with _notify_lock:
@@ -111,6 +168,7 @@ def send_slack_arrival(
         visitor_type,
         purpose,
         session_id,
+        host_slack_user_id,  # ← pass through
     )
 
 
@@ -124,6 +182,14 @@ def send_slack_meeting_scheduled(
     session_id,
     host_slack_user_id: str | None = None,  # <-- add this
 ):
+    if not host_slack_user_id and host_email:
+        host_slack_user_id = get_slack_user_id_by_email(host_email)
+        if not host_slack_user_id:
+            logger.warning(
+                "Could not resolve Slack user for %s — reschedule will fall back to channel",
+                host_email,
+            )
+
     with _notify_lock:
         key = f"meeting_{session_id}"
         new_value = f"{visitor_name}_{date_str}_{time_str}"
@@ -137,62 +203,29 @@ def send_slack_meeting_scheduled(
         _last_notified[key] = new_value
 
     def _send():
+        # ── Build message text ────────────────────────────────────────────────
         if is_reschedule:
-            if host_slack_user_id:
-                # ✅ DM path
-                message = (
-                    f"🔄 *Meeting Rescheduled*\n"
-                    f"• *Visitor:* {visitor_name}\n"
-                    f"• *New Date:* {date_str}  |  *New Time:* {time_str}\n"
-                    f"• *Purpose:* {purpose}\n\n"
-                    f"_Visitor has agreed to the new time._"
-                )
-                data = _post_dm(host_slack_user_id, message)
-                if data:
-                    from services.slack_reply_poller import register_thread
-
-                    register_thread(
-                        session_id=session_id,
-                        channel_id=data["channel"],
-                        thread_ts=data["ts"],
-                    )
-                    logger.info(
-                        f"✅ Reschedule DM sent to {host_name} | thread_ts={data['ts']}"
-                    )
-            else:
-                # Fallback: DM failed, post to channel with reschedule label
-                logger.warning(
-                    f"host_slack_user_id missing — falling back to channel for reschedule"
-                )
-                message = (
-                    f"🔄 *Meeting Rescheduled via AIRA*\n"
-                    f"• *Host:* {host_name} ({host_email})\n"
-                    f"• *Visitor:* {visitor_name}\n"
-                    f"• *New Date:* {date_str}  |  *New Time:* {time_str}\n"
-                    f"• *Purpose:* {purpose}\n\n"
-                    f"_Visitor agreed to the updated time._"
-                )
-                data = _post_message(message)
-                if data:
-                    from services.slack_reply_poller import register_thread
-
-                    register_thread(
-                        session_id=session_id,
-                        channel_id=data["channel"],
-                        thread_ts=data["ts"],
-                    )
-
-        else:
-            # ✅ First notification → post to channel as before
             message = (
-                f"📅 *New Meeting Scheduled via AIRA*\n"
-                f"• *Host:* {host_name} ({host_email})\n"
+                f"🔄 *Meeting Rescheduled*\n"
+                f"• *Visitor:* {visitor_name}\n"
+                f"• *New Date:* {date_str}  |  *New Time:* {time_str}\n"
+                f"• *Purpose:* {purpose}\n\n"
+                f"_Visitor has requested a new time. Please reply to confirm._"
+            )
+            log_label = "Reschedule"
+        else:
+            message = (
+                f"📅 *New Meeting Request via AIRA*\n"
                 f"• *Visitor:* {visitor_name}\n"
                 f"• *Date:* {date_str}  |  *Time:* {time_str}\n"
                 f"• *Purpose:* {purpose}\n\n"
-                f"_A Google Calendar invite with email has been sent to the host._"
+                f"_Please reply to confirm or suggest a different time._"
             )
-            data = _post_message(message)
+            log_label = "New meeting"
+
+        # ── Always prefer DM; fall back to channel only if user ID is missing ─
+        if host_slack_user_id:
+            data = _post_dm(host_slack_user_id, message)
             if data:
                 from services.slack_reply_poller import register_thread
 
@@ -202,8 +235,42 @@ def send_slack_meeting_scheduled(
                     thread_ts=data["ts"],
                 )
                 logger.info(
-                    f"✅ Meeting notification sent for {visitor_name} with {host_name} | thread_ts={data['ts']}"
+                    "✅ %s DM sent to %s | thread_ts=%s",
+                    log_label,
+                    host_name,
+                    data["ts"],
                 )
+                return
+            # DM failed — log and fall through to channel
+            logger.warning(
+                "_post_dm failed for %s (user_id=%s) — falling back to channel",
+                host_name,
+                host_slack_user_id,
+            )
+        else:
+            logger.warning(
+                "host_slack_user_id missing for %s (%s) — falling back to channel",
+                host_name,
+                host_email,
+            )
+
+        # ── Channel fallback (adds host info so they can be identified) ───────
+        channel_message = message + f"\n_Host: {host_name} ({host_email})_"
+        data = _post_message(channel_message)
+        if data:
+            from services.slack_reply_poller import register_thread
+
+            register_thread(
+                session_id=session_id,
+                channel_id=data["channel"],
+                thread_ts=data["ts"],
+            )
+            logger.info(
+                "✅ %s posted to channel for %s | thread_ts=%s",
+                log_label,
+                host_name,
+                data["ts"],
+            )
 
     _executor.submit(_send)
 
