@@ -178,6 +178,12 @@ def _fresh_state() -> Dict[str, Any]:
         "notified_hosts": set(),
         "greeted": False,
         "force_admin": False,
+        # Face verification for name-collision with employee
+        "pending_employee_face_check": False,
+        "pending_employee_name": None,
+        "pending_employee_id": None,
+        "face_verified_name": None,
+        "verified_employee_id": None,
     }
 
 
@@ -416,21 +422,42 @@ def _finalize_meeting_and_log(state: Dict[str, Any]) -> int:
 def _commit_checkin(state: Dict[str, Any]) -> bool:
     db = SessionLocal()
     try:
+        is_employee = state.get("is_employee", False)
         v_name = state.get("visitor_name") or "Guest"
-        visitor = db.query(Visitor).filter(Visitor.name.ilike(v_name)).first()
-        if not visitor:
-            visitor = Visitor(name=v_name)
-            db.add(visitor)
-            db.flush()
-        host_raw = state.get("meeting_with_resolved") or state.get("meeting_with_raw")
-        host_emp = _lookup_employee(host_raw)
-        log = ReceptionLog(
-            visitor_id=visitor.id,
-            employee_id=host_emp.id if host_emp and host_emp.id else None,
-            person_type=state["visitor_type"],
-            purpose=_format_descriptive_purpose(state),
-            check_in_time=datetime.utcnow(),
-        )
+
+        if is_employee:
+            # ── EMPLOYEE check-in: no visitor record, link directly to employee ──
+            emp_id = state.get("verified_employee_id")
+            if not emp_id:
+                # Fallback: look up by name
+                emp_record = _lookup_employee(v_name)
+                emp_id = emp_record.id if emp_record and emp_record.id else None
+            log = ReceptionLog(
+                visitor_id=None,  # employees are NOT stored in visitors table
+                employee_id=emp_id,
+                person_type="Employee",
+                purpose=_format_descriptive_purpose(state),
+                check_in_time=datetime.utcnow(),
+            )
+        else:
+            # ── VISITOR check-in: get-or-create visitor record ────────────────
+            visitor = db.query(Visitor).filter(Visitor.name.ilike(v_name)).first()
+            if not visitor:
+                visitor = Visitor(name=v_name)
+                db.add(visitor)
+                db.flush()
+            host_raw = state.get("meeting_with_resolved") or state.get(
+                "meeting_with_raw"
+            )
+            host_emp = _lookup_employee(host_raw)
+            log = ReceptionLog(
+                visitor_id=visitor.id,
+                employee_id=host_emp.id if host_emp and host_emp.id else None,
+                person_type=state["visitor_type"],
+                purpose=_format_descriptive_purpose(state),
+                check_in_time=datetime.utcnow(),
+            )
+
         db.add(log)
         db.commit()
         return True
@@ -456,8 +483,7 @@ def _merge_checkin_entities(
     if v_name and not _is_jarvis(v_name):
         new_name = v_name.capitalize()
 
-        # Only mark the speaker as an employee when THEY explicitly say so.
-        # Never infer it just from a name collision with the employee table.
+        # Case 1: Speaker explicitly claims to be an employee
         speaker_claims_employee = (
             "i am an employee" in query_low
             or "i work here" in query_low
@@ -473,6 +499,16 @@ def _merge_checkin_entities(
             if emp_record:
                 state["is_employee"] = True
                 state["visitor_type"] = "Employee"
+                state["verified_employee_id"] = emp_record.id
+
+        # Case 2: Name matches an employee — flag for face verification.
+        # Only triggered once per session (cleared after verification).
+        elif not state.get("is_employee") and not state.get("face_verified_name"):
+            emp_record = get_employee_by_name(new_name)
+            if emp_record:
+                state["pending_employee_face_check"] = True
+                state["pending_employee_name"] = new_name
+                state["pending_employee_id"] = emp_record.id
 
         # Update visitor name in session
         if state.get("visitor_name") and state["visitor_name"] != new_name:
@@ -745,3 +781,44 @@ async def _llm_reply(
     resp = await llm.get_raw_response(prompt, client_id=client_id)
     state["greeted"] = True
     return resp
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FACE VERIFICATION INTEGRATION HELPER
+# Called by the WebSocket handler after running DeepFace verification
+# when a visitor's name matched an employee record.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def mark_employee_from_face_result(client_id: str, face_verified: bool) -> None:
+    """
+    Called by the WebSocket layer after face verification for a name-collision case.
+
+    If face_verified=True  → promote session to employee (no visitor DB record).
+    If face_verified=False → confirm as visitor, clear the pending check so the
+                             visitor flow continues normally.
+    """
+    state = get_session_state(client_id)
+
+    if face_verified:
+        state["is_employee"] = True
+        state["visitor_type"] = "Employee"
+        state["verified_employee_id"] = state.get("pending_employee_id")
+        logger.info(
+            "[face] '%s' confirmed as employee (id=%s) via face verification.",
+            state.get("pending_employee_name"),
+            state.get("pending_employee_id"),
+        )
+    else:
+        logger.info(
+            "[face] '%s' face did NOT match employee record — treating as visitor.",
+            state.get("pending_employee_name"),
+        )
+
+    # Store the name that was checked so we don't re-trigger on the next turn
+    state["face_verified_name"] = state.get("pending_employee_name")
+
+    # Clear the pending flags regardless of outcome
+    state.pop("pending_employee_face_check", None)
+    state.pop("pending_employee_name", None)
+    state.pop("pending_employee_id", None)
