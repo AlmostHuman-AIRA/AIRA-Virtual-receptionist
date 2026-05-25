@@ -195,7 +195,7 @@ def seed_database():
             ),
             Employee(
                 name="Jack",
-                email="sannidhivk15+sannidhi@gmail.com",
+                email="jackw1821886@gmail.com",
                 department="Sales",
                 role="Sales Director",
                 location="Floor 1, Room 105",
