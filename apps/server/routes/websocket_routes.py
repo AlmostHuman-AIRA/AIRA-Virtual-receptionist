@@ -372,6 +372,14 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
     whisper_processor = WhisperProcessor.get_instance()
     tts_processor = KokoroTTSProcessor.get_instance()
     text_queue: asyncio.Queue[str] = asyncio.Queue()
+    # ── FIX: Pull any pending reply that was generated but not delivered ────────
+    # If the previous connection broke while brain() was sending audio, the reply
+    # text is stored in _pending_reply so we can re-speak it on reconnect.
+    _pending_reply = _existing.get("_pending_reply") if _existing else None
+    if _pending_reply and _preserve_session:
+        logger.info(f"[{client_id}] Reconnect: found undelivered reply, will re-speak.")
+    # ────────────────────────────────────────────────────────────────────────────
+
     session_state = {
         "mode": (
             "FOLLOWUP" if _preserve_session else "PASSIVE"
@@ -395,6 +403,15 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                 {"status": "connected", "client_id": client_id, "state": "passive"}
             )
         )
+
+        # ── FIX: Re-queue any reply that was generated but not delivered ─────────
+        # This happens when the WebSocket broke while brain() was sending audio.
+        # We inject the stored reply directly into text_queue so it gets re-spoken.
+        if _pending_reply:
+            await text_queue.put(f"RESEND_REPLY:{_pending_reply}")
+            if _existing:
+                _existing.pop("_pending_reply", None)  # consume it — don't loop
+        # ─────────────────────────────────────────────────────────────────────────
 
         async def send_keepalive():
             while True:
@@ -1169,6 +1186,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                     )
                     and not text.startswith("SYSTEM:")
                     and not text.startswith("SLACK_REPLY:")
+                    and not text.startswith("RESEND_REPLY:")
                 ):
                     text_lower = text.lower()
                     if any(
@@ -1187,14 +1205,17 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                 # If process_text_for_client raised on the SLACK_REPLY path,
                 # task_done() was never called and the queue jammed permanently.
                 try:
-                    # --- BYPASS LLM FOR SLACK REPLY SENTINELS ---
-                    if text and text.startswith("SLACK_REPLY:"):
-                        # FIX #1: force mode back to FOLLOWUP so the session is
-                        # "alive" when brain() tries to send audio back to the user.
-                        # Without this, the 12s FOLLOWUP timeout may have already
-                        # flipped mode → PASSIVE before the watcher injected this item.
+                    # --- RESEND: re-deliver a reply that was dropped due to disconnect ---
+                    if text and text.startswith("RESEND_REPLY:"):
+                        reply_text = text.split("RESEND_REPLY:", 1)[1]
                         session_state["mode"] = "FOLLOWUP"
-                        # Pass the raw sentinel directly to query_router
+                        logger.info(f"[{client_id}] Re-speaking undelivered reply.")
+
+                    # --- BYPASS LLM FOR SLACK REPLY SENTINELS ---
+                    elif text and text.startswith("SLACK_REPLY:"):
+                        # Force mode back to FOLLOWUP so the session is "alive"
+                        # when brain() tries to send audio back to the user.
+                        session_state["mode"] = "FOLLOWUP"
                         reply_text = await process_text_for_client(client_id, text)
 
                     # --- BYPASS LLM FOR SYSTEM MESSAGES ---
@@ -1219,6 +1240,19 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                         session_state["mode"] = "PASSIVE"
                         await websocket.send_text(json.dumps({"state": "passive"}))
                         continue
+
+                    # ── FIX: Save reply into router state BEFORE attempting to send
+                    # audio. If the WebSocket dies mid-send, the reconnect handler
+                    # will find this and re-inject it via RESEND_REPLY so the user
+                    # actually hears what Jarvis wanted to say.
+                    try:
+                        from services.query_router import get_session_state as _gss
+
+                        _router_state = _gss(client_id)
+                        _router_state["_pending_reply"] = reply_text
+                    except Exception:
+                        pass
+                    # ────────────────────────────────────────────────────────────
 
                     audio, word_timings = (
                         await tts_processor.synthesize_remaining_speech_with_timing(
@@ -1246,6 +1280,16 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                         # Wait for audio to physically finish playing on the frontend
                         await asyncio.sleep((len(audio) / 24000.0) + 0.5)
 
+                    # ── FIX: Audio delivered successfully — clear the pending reply ─
+                    try:
+                        from services.query_router import get_session_state as _gss
+
+                        _router_state = _gss(client_id)
+                        _router_state.pop("_pending_reply", None)
+                    except Exception:
+                        pass
+                    # ────────────────────────────────────────────────────────────────
+
                     # --- 2. ROUTE TO CORRECT MODE ---
                     if is_terminal:
                         logger.info(
@@ -1264,6 +1308,8 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                     logger.info(
                         f"[{client_id}] Client disconnected before AI could finish responding."
                     )
+                    # _pending_reply is intentionally NOT cleared here — it will be
+                    # re-delivered on the next reconnect via RESEND_REPLY.
                     break
                 finally:
                     session_state["brain_is_thinking"] = False
