@@ -6,12 +6,41 @@ from fastapi import FastAPI
 from models.whisper_processor import WhisperProcessor
 from models.groq_processor import GroqProcessor
 from models.tts_processor import KokoroTTSProcessor
-from receptionist.database import engine
+import sqlite3
+from pathlib import Path
+
+from receptionist.database import engine, _db_path
 from receptionist.models import Base
 from receptionist.seed_data import seed_database
 from services.face_recognition_service import cleanup_old_captures
 
 logger = logging.getLogger(__name__)
+
+
+def _migrate_visitors_columns() -> None:
+    """Idempotent: adds first_seen / last_seen to visitors if missing.
+    Safe to run on every startup — skips columns that already exist."""
+    from datetime import datetime
+
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    needed = [("first_seen", "DATETIME", now), ("last_seen", "DATETIME", now)]
+    try:
+        conn = sqlite3.connect(str(_db_path))
+        cur = conn.cursor()
+        cur.execute("PRAGMA table_info(visitors)")
+        existing = {row[1] for row in cur.fetchall()}
+        for col, col_type, default in needed:
+            if col in existing:
+                continue
+            cur.execute(f"ALTER TABLE visitors ADD COLUMN {col} {col_type}")
+            cur.execute(
+                f"UPDATE visitors SET {col} = ? WHERE {col} IS NULL", (default,)
+            )
+            conn.commit()
+            logger.info("Migration: added column '%s' to visitors table.", col)
+        conn.close()
+    except Exception as exc:
+        logger.error("Column migration failed: %s", exc)
 
 
 @asynccontextmanager
@@ -29,6 +58,7 @@ async def lifespan(app: FastAPI):
 
         def _init_db():
             Base.metadata.create_all(bind=engine)
+            _migrate_visitors_columns()  # adds first_seen/last_seen if missing
             seed_database()
 
         await loop.run_in_executor(None, _init_db)

@@ -26,6 +26,10 @@ from services.person_detection_service import (
     get_person_detection_service,
     warmup_mediapipe,
 )
+from services.query_router import (
+    clear_session_state,
+    mark_employee_from_face_result,  # <--- ADD THIS IMPORT
+)
 
 # Thread pool for running blocking DeepFace and MediaPipe calls without blocking the async event loop.
 _face_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="deepface")
@@ -184,6 +188,11 @@ _VISITOR_KEYWORDS = (
     "onboarding",
     "appointment",
     "visiting",
+    "client",
+    "sales demo",
+    "demo",
+    "sales meeting",
+    "here for a",
 )
 
 
@@ -386,6 +395,8 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
         ),  # ✅ stay in FOLLOWUP if waiting
         "awaiting_face": False,
         "is_verified": False,
+        "verified_name": None,
+        "claimed_name": None,
         "visitor_reference_image_b64": None,
         "pending_identity_name": None,
         "person_type": "employee",
@@ -461,6 +472,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                     )  # reset so next session can't inherit a stale clock
                     session_state["is_verified"] = False
                     session_state["verified_name"] = None  # <--- ADD THIS
+                    session_state["claimed_name"] = None
                     session_state["visitor_reference_image_b64"] = None
                     session_state["visitor_captured"] = False  # ← ADD THIS
                     session_state["pending_identity_name"] = None
@@ -501,7 +513,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
 
                             # Cooldown: skip if we triggered recently (prevent rapid re-activation)
                             PRESENCE_FRAME_COOLDOWN = float(
-                                os.getenv("PRESENCE_FRAME_COOLDOWN", "5.0")
+                                os.getenv("PRESENCE_FRAME_COOLDOWN", "9.0")
                             )
                             if (
                                 time.time() - session_state["last_presence_trigger"]
@@ -529,7 +541,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                 )
 
                                 PRESENCE_CONFIRM_FRAMES = int(
-                                    os.getenv("PRESENCE_CONFIRM_FRAMES", "2")
+                                    os.getenv("PRESENCE_CONFIRM_FRAMES", "3")
                                 )
                                 if (
                                     session_state["presence_count"]
@@ -603,7 +615,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                 result = await loop.run_in_executor(
                                     _face_executor,
                                     lambda: verify_person_face(
-                                        person_type="visitor",
+                                        person_type=person_type,
                                         audio_name=audio_name,
                                         image_b64=image_b64,
                                     ),
@@ -777,11 +789,27 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                 # (it was parked at +3600 while we waited for the camera frame)
                                 followup_entered_at = time.time()
                             elif person_type == "employee":
+                                result["message"] = (
+                                    f"I wasn't able to verify you as {audio_name} from our employee records. "
+                                    f"I'll check you in as a visitor — could you let me know who you're here to meet?"
+                                )
                                 session_state["is_verified"] = False
-                                session_state["pending_identity_name"] = audio_name
-                                # Restart the clock even on mismatch so the user gets a
-                                # chance to hear the rejection message and try again
+                                # Name matched an employee but face didn't — treat as visitor
+                                # mark_employee_from_face_result already set is_employee=False in query_router state
+                                # Now flip this session to visitor mode so the visitor flow takes over
+                                session_state["person_type"] = "visitor"
+                                session_state["pending_identity_name"] = None
+                                session_state["claimed_name"] = (
+                                    audio_name  # <--- ADD THIS   # stop re-asking for face
+                                )
+                                session_state["visitor_captured"] = (
+                                    False  # allow visitor photo capture
+                                )
                                 followup_entered_at = time.time()
+                                logger.info(
+                                    f"[{client_id}] Employee face mismatch for '{audio_name}' — "
+                                    f"switching to visitor flow."
+                                )
 
                             logger.info(
                                 f"[{client_id}] Face verify result for '{audio_name}': "
