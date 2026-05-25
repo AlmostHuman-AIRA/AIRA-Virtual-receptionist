@@ -20,7 +20,6 @@ logger = logging.getLogger(__name__)
 # You need two new env vars:
 #   SLACK_BOT_TOKEN   — your bot's OAuth token (xoxb-...)
 #   SLACK_CHANNEL_ID  — the channel/DM ID to post into
-#                       (right-click the channel in Slack → Copy link → last segment is the ID)
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN", "")
 SLACK_CHANNEL_ID = os.getenv("SLACK_CHANNEL_ID", "")  # e.g. C08xxxxxxx or D08xxxxxxx
 
@@ -54,9 +53,6 @@ def _post_message(text: str) -> dict | None:
         return None
 
 
-# ── notify_slack.py (fixed) ──────────────────────────────────────────────────
-
-
 def _get_employee_slack_info(employee_name: str) -> tuple[str | None, str | None]:
     """
     Look up slack_user_id and slack_dm_channel from the employees DB by name.
@@ -82,6 +78,29 @@ def _get_employee_slack_info(employee_name: str) -> tuple[str | None, str | None
     return None, None
 
 
+def _register_and_log(session_id: str, data: dict, label: str) -> None:
+    """Helper: register a thread for reply polling and log success."""
+    from services.slack_reply_poller import register_thread
+
+    register_thread(
+        session_id=session_id,
+        channel_id=data["channel"],
+        thread_ts=data["ts"],
+    )
+    logger.info(
+        "✅ %s | channel=%s thread_ts=%s",
+        label,
+        data["channel"],
+        data["ts"],
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ARRIVAL NOTIFICATION
+# Fallback chain: DM (App inbox) → @mention in channel → plain channel post
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 def _send_arrival_thread(
     employee_name: str,
     visitor_name: str,
@@ -90,18 +109,20 @@ def _send_arrival_thread(
     session_id: str,
     host_slack_user_id: str | None = None,
 ):
-    logger.info(f"Slack thread started for {visitor_name} -> {employee_name}")
+    logger.info(
+        "Slack arrival thread started for %s -> %s", visitor_name, employee_name
+    )
 
-    # ── FIX: look up from DB if not passed in ────────────────────────────────
+    # ── Resolve user ID from DB if not passed in ──────────────────────────
     if not host_slack_user_id:
-        host_slack_user_id, cached_dm_channel = _get_employee_slack_info(employee_name)
+        host_slack_user_id, _ = _get_employee_slack_info(employee_name)
         if host_slack_user_id:
             logger.info(
-                f"Resolved slack_user_id for {employee_name} from DB: {host_slack_user_id}"
+                "Resolved slack_user_id for %s: %s", employee_name, host_slack_user_id
             )
         else:
             logger.warning(
-                f"No slack_user_id in DB for {employee_name} — will fall back to channel"
+                "No slack_user_id for %s — will go straight to channel", employee_name
             )
 
     message = (
@@ -114,33 +135,32 @@ def _send_arrival_thread(
 
     data = None
 
-    # ── Try DM first ─────────────────────────────────────────────────────────
     if host_slack_user_id:
+        # ── Primary: DM (lands in App inbox, private to host) ─────────────
         data = _post_dm(host_slack_user_id, message)
         if data:
-            logger.info(f"✅ Arrival DM sent to {employee_name}")
-        else:
-            logger.warning(f"DM failed for {employee_name} — falling back to channel")
+            _register_and_log(session_id, data, f"Arrival DM → {employee_name}")
+            return
 
-    # ── ALSO post to channel (so reception desk sees it too) ─────────────────
+        logger.warning("DM failed for %s — trying @mention fallback", employee_name)
+
+        # ── Fallback 1: @mention in #reception_desk ───────────────────────
+        data = _post_channel_mention(host_slack_user_id, message)
+        if data:
+            _register_and_log(session_id, data, f"Arrival @mention → {employee_name}")
+            return
+
+        logger.warning(
+            "@mention failed for %s — trying plain channel post", employee_name
+        )
+
+    # ── Fallback 2: plain channel post (no user ID, or all else failed) ───
     channel_message = message + f"\n_Host: {employee_name}_"
-    channel_data = _post_message(channel_message)
-
-    # ── Register thread — prefer DM thread, fall back to channel thread ──────
-    final_data = data or channel_data
-    if final_data:
-        from services.slack_reply_poller import register_thread
-
-        register_thread(
-            session_id=session_id,
-            channel_id=final_data["channel"],
-            thread_ts=final_data["ts"],
-        )
-        logger.info(
-            f"✅ Registered thread | channel={final_data['channel']} ts={final_data['ts']}"
-        )
+    data = _post_message(channel_message)
+    if data:
+        _register_and_log(session_id, data, f"Arrival channel post → {employee_name}")
     else:
-        logger.error(f"❌ Both DM and channel post failed for {employee_name}")
+        logger.error("❌ All notification methods failed for %s", employee_name)
 
 
 def send_slack_arrival(
@@ -149,18 +169,20 @@ def send_slack_arrival(
     visitor_type: str,
     purpose: str,
     session_id: str,
-    host_slack_user_id: str | None = None,  # ← add this
+    host_slack_user_id: str | None = None,
 ):
     """Submit arrival notification; deduplicate per session."""
     with _notify_lock:
         if _last_notified.get(session_id) == visitor_name:
             logger.warning(
-                f"Blocking duplicate notification to '{employee_name}' in session {session_id}"
+                "Blocking duplicate notification to '%s' in session %s",
+                employee_name,
+                session_id,
             )
             return
         _last_notified[session_id] = visitor_name
 
-    logger.info(f"Queuing Slack notification for {visitor_name}...")
+    logger.info("Queuing Slack arrival notification for %s...", visitor_name)
     _executor.submit(
         _send_arrival_thread,
         employee_name,
@@ -168,25 +190,31 @@ def send_slack_arrival(
         visitor_type,
         purpose,
         session_id,
-        host_slack_user_id,  # ← pass through
+        host_slack_user_id,
     )
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# MEETING NOTIFICATION
+# Fallback chain: DM (App inbox) → @mention in channel → plain channel post
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 def send_slack_meeting_scheduled(
-    host_name,
-    host_email,
-    visitor_name,
-    date_str,
-    time_str,
-    purpose,
-    session_id,
-    host_slack_user_id: str | None = None,  # <-- add this
+    host_name: str,
+    host_email: str,
+    visitor_name: str,
+    date_str: str,
+    time_str: str,
+    purpose: str,
+    session_id: str,
+    host_slack_user_id: str | None = None,
 ):
     if not host_slack_user_id and host_email:
         host_slack_user_id = get_slack_user_id_by_email(host_email)
         if not host_slack_user_id:
             logger.warning(
-                "Could not resolve Slack user for %s — reschedule will fall back to channel",
+                "Could not resolve Slack user for %s — will fall back to channel",
                 host_email,
             )
 
@@ -197,13 +225,13 @@ def send_slack_meeting_scheduled(
 
         if _last_notified.get(key) == new_value:
             logger.warning(
-                f"Blocking duplicate meeting notification for {visitor_name}"
+                "Blocking duplicate meeting notification for %s", visitor_name
             )
             return
         _last_notified[key] = new_value
 
     def _send():
-        # ── Build message text ────────────────────────────────────────────────
+        # ── Build message ─────────────────────────────────────────────────
         if is_reschedule:
             message = (
                 f"🔄 *Meeting Rescheduled*\n"
@@ -223,56 +251,53 @@ def send_slack_meeting_scheduled(
             )
             log_label = "New meeting"
 
-        # ── Always prefer DM; fall back to channel only if user ID is missing ─
         if host_slack_user_id:
+            # ── Primary: DM ───────────────────────────────────────────────
             data = _post_dm(host_slack_user_id, message)
             if data:
-                from services.slack_reply_poller import register_thread
-
-                register_thread(
-                    session_id=session_id,
-                    channel_id=data["channel"],
-                    thread_ts=data["ts"],
-                )
-                logger.info(
-                    "✅ %s DM sent to %s | thread_ts=%s",
-                    log_label,
-                    host_name,
-                    data["ts"],
-                )
+                _register_and_log(session_id, data, f"{log_label} DM → {host_name}")
                 return
-            # DM failed — log and fall through to channel
+
             logger.warning(
-                "_post_dm failed for %s (user_id=%s) — falling back to channel",
+                "DM failed for %s (user_id=%s) — trying @mention fallback",
                 host_name,
                 host_slack_user_id,
             )
+
+            # ── Fallback 1: @mention in #reception_desk ───────────────────
+            data = _post_channel_mention(host_slack_user_id, message)
+            if data:
+                _register_and_log(
+                    session_id, data, f"{log_label} @mention → {host_name}"
+                )
+                return
+
+            logger.warning(
+                "@mention failed for %s — trying plain channel post", host_name
+            )
         else:
             logger.warning(
-                "host_slack_user_id missing for %s (%s) — falling back to channel",
+                "host_slack_user_id missing for %s (%s) — skipping DM and @mention",
                 host_name,
                 host_email,
             )
 
-        # ── Channel fallback (adds host info so they can be identified) ───────
+        # ── Fallback 2: plain channel post ────────────────────────────────
         channel_message = message + f"\n_Host: {host_name} ({host_email})_"
         data = _post_message(channel_message)
         if data:
-            from services.slack_reply_poller import register_thread
-
-            register_thread(
-                session_id=session_id,
-                channel_id=data["channel"],
-                thread_ts=data["ts"],
+            _register_and_log(
+                session_id, data, f"{log_label} channel post → {host_name}"
             )
-            logger.info(
-                "✅ %s posted to channel for %s | thread_ts=%s",
-                log_label,
-                host_name,
-                data["ts"],
-            )
+        else:
+            logger.error("❌ All notification methods failed for %s", host_name)
 
     _executor.submit(_send)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SLACK API HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def get_slack_user_id_by_email(email: str) -> str | None:
@@ -314,7 +339,7 @@ def _get_dm_channel(user_id: str) -> str | None:
 
 
 def _post_dm(user_id: str, text: str) -> dict | None:
-    """Send a DM to a specific user."""
+    """Send a DM to a specific user (lands in App inbox)."""
     dm_channel = _get_dm_channel(user_id)
     if not dm_channel:
         return None
@@ -335,6 +360,39 @@ def _post_dm(user_id: str, text: str) -> dict | None:
         return None
 
 
+def _post_channel_mention(user_id: str, text: str) -> dict | None:
+    """
+    Fallback: post to the shared reception channel with an @mention.
+    Used when _post_dm fails.
+    """
+    if not SLACK_BOT_TOKEN or not SLACK_CHANNEL_ID:
+        logger.error("SLACK_BOT_TOKEN or SLACK_CHANNEL_ID not set.")
+        return None
+    try:
+        response = httpx.post(
+            "https://slack.com/api/chat.postMessage",
+            headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
+            json={
+                "channel": SLACK_CHANNEL_ID,
+                "text": f"<@{user_id}>\n{text}",
+            },
+            timeout=10,
+        )
+        data = response.json()
+        if not data.get("ok"):
+            logger.error("channel mention postMessage failed: %s", data.get("error"))
+            return None
+        return data
+    except Exception as e:
+        logger.error("channel mention postMessage exception: %s", e)
+        return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SESSION CLEANUP
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 def clear_session(session_id: str):
     """Clean up notification history for a session."""
     from services.slack_reply_poller import unregister_thread
@@ -346,4 +404,4 @@ def clear_session(session_id: str):
         ]
         for k in keys_to_remove:
             _last_notified.pop(k, None)
-    logger.info(f"Cleared Slack cache for session {session_id}")
+    logger.info("Cleared Slack cache for session %s", session_id)
