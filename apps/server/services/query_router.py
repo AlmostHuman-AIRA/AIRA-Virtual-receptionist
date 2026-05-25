@@ -950,24 +950,37 @@ async def route_query(client_id: str, user_query: str) -> str:
                             state["host_preapproved"] = True
                             # -----------------------------------------
 
-                constraint_desc = ""
-                if state.get("sched_time_before"):
-                    constraint_desc = (
-                        f"before {_fmt_display(state['sched_time_before'])}"
-                    )
-                elif state.get("sched_time_after"):
-                    constraint_desc = f"after {_fmt_display(state['sched_time_after'])}"
-                elif state.get("sched_time"):
-                    constraint_desc = f"at {_fmt_display(state['sched_time'])}"
+                    constraint_desc = ""
+                    if state.get("sched_time_before"):
+                        constraint_desc = (
+                            f"before {_fmt_display(state['sched_time_before'])}"
+                        )
+                    elif state.get("sched_time_after"):
+                        constraint_desc = (
+                            f"after {_fmt_display(state['sched_time_after'])}"
+                        )
+                    elif state.get("sched_time"):
+                        constraint_desc = f"at {_fmt_display(state['sched_time'])}"
 
-                situation = (
-                    f'{host_name} replied via Slack: "{slack_reply}". '
-                    f"{'The host proposes a time ' + constraint_desc + '. ' if constraint_desc else ''}"
-                    f"Ask the visitor if this works or relay the message naturally."
+                    situation = (
+                        f'{host_name} replied via Slack: "{slack_reply}". '
+                        f"{'The host proposes a time ' + constraint_desc + '. ' if constraint_desc else ''}"
+                        f"Ask the visitor if this works or relay the message naturally."
+                    )
+
+                else:
+                    # ← correct level: no time found in host's reply at all → soft decline
+                    state["scheduling_active"] = False
+                    state["awaiting_slack_reply"] = False
+                    situation = (
+                        f'{host_name} replied via Slack: "{slack_reply}". '
+                        f"Relay this to the visitor naturally. If it seems like a decline or unavailability, "
+                        f"apologize and offer to reschedule or contact someone else."
+                    )
+
+                return await _llm_reply(
+                    situation, state, "[System: Slack Reply Received]", client_id
                 )
-            return await _llm_reply(
-                situation, state, "[System: Slack Reply Received]", client_id
-            )
 
         # Non-scheduling flow
         situation = (

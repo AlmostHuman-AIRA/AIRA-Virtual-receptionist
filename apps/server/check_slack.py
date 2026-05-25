@@ -1,34 +1,35 @@
+# test_slack_lookup.py — run this standalone to verify IDs
 import httpx, os
-
 from dotenv import load_dotenv
-import os
 
-# Point this to where your .env actually is
-load_dotenv(r"C:\Users\Administrator\Desktop\CPU-compatible-AI-\apps\server\.env")
+load_dotenv()
 
-SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
-print("Token loaded:", SLACK_BOT_TOKEN[:10] if SLACK_BOT_TOKEN else "NOT FOUND")
+TOKEN = os.getenv("SLACK_BOT_TOKEN")
+EMAIL = "lucy62648446@gmail.com"  # from your logs
 
+# Step 1: lookup by email
+r = httpx.get(
+    "https://slack.com/api/users.lookupByEmail",
+    headers={"Authorization": f"Bearer {TOKEN}"},
+    params={"email": EMAIL},
+)
+data = r.json()
+print("lookupByEmail response:", data)
 
-def verify_dm_channel(slack_user_id: str, slack_dm_channel: str):
-    # Check user exists
-    r = httpx.get(
-        "https://slack.com/api/users.info",
-        headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
-        params={"user": slack_user_id},
-    )
-    print("User lookup:", r.json().get("ok"), r.json().get("error", ""))
+if data.get("ok"):
+    user_id = data["user"]["id"]
+    print(f"User ID: {user_id}")
+    print(f"Display name: {data['user']['profile'].get('display_name')}")
+    print(f"Real name: {data['user']['profile'].get('real_name')}")
 
-    # Try opening DM — should return same channel ID
+    # Step 2: open DM channel
     r2 = httpx.post(
         "https://slack.com/api/conversations.open",
-        headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
-        json={"users": slack_user_id},
+        headers={"Authorization": f"Bearer {TOKEN}"},
+        json={"users": user_id},
     )
-    live_dm = r2.json().get("channel", {}).get("id")
-    print(f"DB has dm_channel:   {slack_dm_channel}")
-    print(f"Slack returns:       {live_dm}")
-    print(f"Match: {slack_dm_channel == live_dm}")
-
-
-verify_dm_channel("U0123ABC", "D0456DEF")  # paste values from Step 1
+    data2 = r2.json()
+    print("conversations.open response:", data2)
+    if data2.get("ok"):
+        print(f"DM channel ID: {data2['channel']['id']}")
+        print(f"Is user DM (starts with D): {data2['channel']['id'].startswith('D')}")

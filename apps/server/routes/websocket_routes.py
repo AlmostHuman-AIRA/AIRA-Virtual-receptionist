@@ -1298,7 +1298,6 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                     break
 
                 if not state.get("awaiting_slack_reply"):
-                    elapsed = 0
                     continue
 
                 elapsed += POLL_INTERVAL
@@ -1360,9 +1359,13 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                 timeout=120,
             )
 
+        # ✅ Only cancel watcher if NOT still waiting for Slack reply
+        try:
+            await asyncio.wait_for(text_queue.join(), timeout=5.0)
+        except asyncio.TimeoutError:
+            pass
         brain_task.cancel()
 
-        # ✅ Only cancel watcher if NOT still waiting for Slack reply
         try:
             _state = _qs(client_id)
             if not _state.get("awaiting_slack_reply"):
