@@ -77,14 +77,6 @@ async def test_challenge(request: Request):
 # Include routes after dispatcher is defined
 from routes.api_routes import router as api_router
 from routes.websocket_routes import router as websocket_router
-<<<<<<< HEAD
-from routes.employee_routes import router as employee_router
-
-app.include_router(api_router)
-app.include_router(websocket_router)
-app.include_router(employee_router, prefix="/api")
-# app.include_router(slack_router)
-=======
 from routes.employee_routes import (
     router as employee_router,
 )  # Employee photo upload API
@@ -98,7 +90,6 @@ app.include_router(
 app.include_router(
     dashboard_router, prefix="/api/dashboard"
 )  # Registers GET/POST /api/dashboard/*
->>>>>>> humanvoice
 
 
 def main():
