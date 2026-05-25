@@ -62,6 +62,10 @@ ALL_SLOTS_1H: List[str] = [
     "16:00",
     "16:30",
     "17:00",
+    "17:30",
+    "18:00",
+    "18:30",
+    "19:00",
 ]
 
 
@@ -390,20 +394,24 @@ def get_employee_by_name(name: str) -> Optional[Employee]:
 
         row = public.filter(
             or_(
-                Employee.name.ilike(f"%{name_clean}%"),
+                Employee.name.ilike(f"% {name_clean}%"),
                 Employee.name.ilike(f"{name_clean}%"),
             )
         ).first()
         if row:
             return row
 
+        # Use a strict 0.85 cutoff (85% similarity)
         all_employees = public.all()
         emp_names = [e.name for e in all_employees]
-        matches = difflib.get_close_matches(name_clean, emp_names, n=1, cutoff=0.6)
+        matches = difflib.get_close_matches(name_clean, emp_names, n=1, cutoff=0.85)
         if matches:
-            for emp in all_employees:
-                if emp.name == matches[0]:
-                    return emp
+            # Confirm that we aren't matching words with completely different prefix sounds
+            matched_name = matches[0].lower()
+            if abs(len(name_clean) - len(matched_name)) <= 2:
+                for emp in all_employees:
+                    if emp.name == matches[0]:
+                        return emp
         return None
     except Exception as exc:
         logger.error("get_employee_by_name failed: %s", exc)
@@ -561,7 +569,12 @@ def get_employee_meetings(employee_name: str, meeting_date: str) -> List[Meeting
         session.close()
 
 
-def get_available_slots(employee_name: str, meeting_date: str) -> List[str]:
+def get_available_slots(
+    employee_name: str,
+    meeting_date: str,
+    after_time: Optional[str] = None,
+    before_time: Optional[str] = None,
+) -> List[str]:
     norm_date = _normalize_date(meeting_date)
     if not norm_date:
         return []
@@ -570,29 +583,41 @@ def get_available_slots(employee_name: str, meeting_date: str) -> List[str]:
     try:
         emp = _resolve_employee(employee_name, session)
         if not emp:
-            return ALL_SLOTS_1H
+            slots = list(ALL_SLOTS_1H)
+        else:
+            start_dt = datetime.strptime(norm_date, "%Y-%m-%d")
+            end_dt = start_dt + timedelta(days=1)
 
-        start_dt = datetime.strptime(norm_date, "%Y-%m-%d")
-        end_dt = start_dt + timedelta(days=1)
-
-        booked_meetings = (
-            session.query(Meeting)
-            .filter(
-                Meeting.host_employee_id == emp.id,
-                Meeting.scheduled_start >= start_dt,
-                Meeting.scheduled_start < end_dt,
-                Meeting.status == "scheduled",
+            booked_meetings = (
+                session.query(Meeting)
+                .filter(
+                    Meeting.host_employee_id == emp.id,
+                    Meeting.scheduled_start >= start_dt,
+                    Meeting.scheduled_start < end_dt,
+                    Meeting.status == "scheduled",
+                )
+                .all()
             )
-            .all()
-        )
 
-        booked_times = {
-            m.scheduled_start.strftime("%H:%M")
-            for m in booked_meetings
-            if m.scheduled_start
-        }
+            booked_times = {
+                m.scheduled_start.strftime("%H:%M")
+                for m in booked_meetings
+                if m.scheduled_start
+            }
 
-        return [s for s in ALL_SLOTS_1H if s not in booked_times]
+            slots = [s for s in ALL_SLOTS_1H if s not in booked_times]
+
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        if norm_date == today_str:
+            current_hhmm = datetime.now().strftime("%H:%M")
+            slots = [s for s in slots if s > current_hhmm]
+
+        if after_time:
+            slots = [s for s in slots if s > after_time]
+        if before_time:
+            slots = [s for s in slots if s < before_time]
+
+        return slots
     except Exception as exc:
         logger.error("get_available_slots failed: %s", exc)
         return []

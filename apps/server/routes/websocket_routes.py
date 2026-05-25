@@ -26,6 +26,10 @@ from services.person_detection_service import (
     get_person_detection_service,
     warmup_mediapipe,
 )
+from services.query_router import (
+    clear_session_state,
+    mark_employee_from_face_result,  # <--- ADD THIS IMPORT
+)
 
 # Thread pool for running blocking DeepFace and MediaPipe calls without blocking the async event loop.
 _face_executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix="deepface")
@@ -184,18 +188,38 @@ _VISITOR_KEYWORDS = (
     "onboarding",
     "appointment",
     "visiting",
+    "client",
+    "sales demo",
+    "demo",
+    "sales meeting",
+    "here for a",
 )
 
 
 def _detect_person_type(text: str) -> str:
     """
-    Returns 'visitor' if the transcript contains delivery/visitor keywords,
-    otherwise returns 'employee'.
+    Returns 'visitor' if the transcript contains delivery/visitor keywords
+    OR if the person is simply introducing themselves (not an employee greeting).
+    Otherwise returns 'employee'.
     """
     lower = text.lower()
+
+    # Explicit visitor/delivery keywords
     for keyword in _VISITOR_KEYWORDS:
         if keyword in lower:
             return "visitor"
+
+    # Self-introduction patterns ("I am X", "I'm X", "my name is X", "X here")
+    # without any employee claim → treat as visitor until DB proves otherwise
+    intro_pattern = re.search(r"\b(i am|i'm|my name is|this is)\b", lower)
+    if intro_pattern:
+        # If they also say "i work here" / "i'm an employee" → employee
+        if re.search(
+            r"\b(i work here|i am an employee|i'm an employee|staff)\b", lower
+        ):
+            return "employee"
+        return "visitor"
+
     return "employee"
 
 
@@ -254,11 +278,10 @@ def _candidate_names_from_transcript(text: str) -> list[str]:
     if not text:
         return []
 
-    # Strip meeting-target names FIRST, before any extraction runs.
-    # Prevents "I'm here to meet Priya" or "schedule a meeting with Lucy"
-    # from extracting the HOST name as the speaker's name.
+    # 1. Strip meeting-target names FIRST, before any extraction runs.
+    # Added "meeting with" and "schedule.*?with" to catch phrases like "schedule a meeting with Lucy"
     safe_text = re.sub(
-        r"\b(?:meet|see|looking for|appointment with|meeting with|schedule\s+\w+\s+with|here for|here to meet|visiting|talk to|speak to|speak with)\s+([A-Z][a-z.\'-]+)\b",
+        r"\b(meet|see|looking for|appointment with|here for|visiting|meeting with|schedule.*?with|scheduled.*?with)\s+([A-Z][a-z.\'-]+)\b",
         "",
         text,
         flags=re.IGNORECASE,
@@ -266,19 +289,25 @@ def _candidate_names_from_transcript(text: str) -> list[str]:
 
     candidates: list[str] = []
 
-    # 1. Try explicit intro phrases — on safe_text, not original text
+    # 2. Try explicit intro phrases (e.g., "I am Raksha", "Raksha here")
     primary = _extract_spoken_name(safe_text)
+
     if primary:
         candidates.append(primary)
         parts = primary.split()
         if len(parts) > 1:
             candidates.append(parts[0])
 
-    # 2. Fallback: capitalized words — also on safe_text
-    capitalized_words = re.findall(r"\b[A-Z][a-z.\'-]+\b", safe_text)
-    for cw in capitalized_words:
-        if len(cw) >= 3 and cw.lower() not in _NAME_STOPWORDS:
-            candidates.append(cw)
+        # --- CRITICAL FIX ---
+        # If we found an explicit introduction, DO NOT fall back to scanning
+        # other capitalized words. This prevents the system from picking up
+        # the host's name just because the visitor's name wasn't in the DB.
+    else:
+        # 3. Fallback: capitalized words (ONLY if no explicit intro was found)
+        capitalized_words = re.findall(r"\b[A-Z][a-z.\'-]+\b", safe_text)
+        for cw in capitalized_words:
+            if len(cw) >= 3 and cw.lower() not in _NAME_STOPWORDS:
+                candidates.append(cw)
 
     # Preserve order, remove duplicates
     seen = set()
@@ -323,34 +352,77 @@ def create_wav_from_pcm(pcm_bytes: bytes, sample_rate: int = SAMPLE_RATE) -> byt
 @router.websocket("/ws/{client_id}")
 async def websocket_endpoint(websocket: WebSocket, client_id: str):
     await manager.connect(websocket, client_id)
-    from services.query_router import clear_session_state
+    from services.query_router import (
+        clear_session_state,
+        get_session_state as _get_existing_state,
+    )
 
-    clear_session_state(client_id)
+    # ✅ Don't wipe session if we're mid-scheduling and waiting for Slack reply
+    _existing = None
+    try:
+        _existing = _get_existing_state(client_id)
+    except Exception:
+        pass
+
+    # Preserve session if we are waiting for a Slack reply, OR if we recently
+    # got a reply and are in the middle of a conversation with a known visitor.
+    _preserve_session = _existing and (
+        _existing.get("awaiting_slack_reply")
+        or _existing.get("visitor_name") is not None
+    )
+
+    if not _preserve_session:
+        clear_session_state(client_id)
+    else:
+        logger.info(
+            f"[{client_id}] Reconnect with pending Slack reply — preserving session."
+        )
+
     whisper_processor = WhisperProcessor.get_instance()
     tts_processor = KokoroTTSProcessor.get_instance()
     text_queue: asyncio.Queue[str] = asyncio.Queue()
+    # ── FIX: Pull any pending reply that was generated but not delivered ────────
+    # If the previous connection broke while brain() was sending audio, the reply
+    # text is stored in _pending_reply so we can re-speak it on reconnect.
+    _pending_reply = _existing.get("_pending_reply") if _existing else None
+    if _pending_reply and _preserve_session:
+        logger.info(f"[{client_id}] Reconnect: found undelivered reply, will re-speak.")
+    # ────────────────────────────────────────────────────────────────────────────
+
     session_state = {
-        "mode": "PASSIVE",
+        "mode": (
+            "FOLLOWUP" if _preserve_session else "PASSIVE"
+        ),  # ✅ stay in FOLLOWUP if waiting
         "awaiting_face": False,
         "is_verified": False,
+        "verified_name": None,
+        "claimed_name": None,
         "visitor_reference_image_b64": None,
         "pending_identity_name": None,
         "person_type": "employee",
         "mismatch_strikes": 0,
         "face_verify_in_progress": False,
         "conversation_complete": False,
-        "visitor_captured": False,  # ← ADD
-        "brain_is_thinking": False,  # ← ADD
+        "visitor_captured": False,
+        "brain_is_thinking": False,
         "presence_count": 0,
         "last_presence_trigger": 0.0,
     }
-
     try:
         await websocket.send_text(
             json.dumps(
                 {"status": "connected", "client_id": client_id, "state": "passive"}
             )
         )
+
+        # ── FIX: Re-queue any reply that was generated but not delivered ─────────
+        # This happens when the WebSocket broke while brain() was sending audio.
+        # We inject the stored reply directly into text_queue so it gets re-spoken.
+        if _pending_reply:
+            await text_queue.put(f"RESEND_REPLY:{_pending_reply}")
+            if _existing:
+                _existing.pop("_pending_reply", None)  # consume it — don't loop
+        # ─────────────────────────────────────────────────────────────────────────
 
         async def send_keepalive():
             while True:
@@ -400,6 +472,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                     )  # reset so next session can't inherit a stale clock
                     session_state["is_verified"] = False
                     session_state["verified_name"] = None  # <--- ADD THIS
+                    session_state["claimed_name"] = None
                     session_state["visitor_reference_image_b64"] = None
                     session_state["visitor_captured"] = False  # ← ADD THIS
                     session_state["pending_identity_name"] = None
@@ -440,7 +513,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
 
                             # Cooldown: skip if we triggered recently (prevent rapid re-activation)
                             PRESENCE_FRAME_COOLDOWN = float(
-                                os.getenv("PRESENCE_FRAME_COOLDOWN", "5.0")
+                                os.getenv("PRESENCE_FRAME_COOLDOWN", "9.0")
                             )
                             if (
                                 time.time() - session_state["last_presence_trigger"]
@@ -468,7 +541,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                 )
 
                                 PRESENCE_CONFIRM_FRAMES = int(
-                                    os.getenv("PRESENCE_CONFIRM_FRAMES", "2")
+                                    os.getenv("PRESENCE_CONFIRM_FRAMES", "3")
                                 )
                                 if (
                                     session_state["presence_count"]
@@ -542,7 +615,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                 result = await loop.run_in_executor(
                                     _face_executor,
                                     lambda: verify_person_face(
-                                        person_type="visitor",
+                                        person_type=person_type,
                                         audio_name=audio_name,
                                         image_b64=image_b64,
                                     ),
@@ -610,8 +683,8 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                             was_already_verified = session_state.get(
                                 "is_verified", False
                             )
-                            # Run DeepFace in a thread pool (it's blocking/CPU-intensive)
                             loop = asyncio.get_event_loop()
+
                             result = await loop.run_in_executor(
                                 _face_executor,
                                 lambda: verify_person_face(
@@ -620,6 +693,91 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                     image_b64=image_b64,
                                 ),
                             )
+
+                            # --- NEW: FALLBACK TO VISITOR ON GENUINE MISMATCH ---
+                            if person_type == "employee" and not result.get("verified"):
+                                # If a face was detected and a photo exists, but it didn't match -> It's a visitor with the same name!
+                                if result.get("has_photo") and result.get(
+                                    "face_detected", True
+                                ):
+                                    logger.info(
+                                        f"[{client_id}] Employee face mismatch for '{audio_name}'. Falling back to visitor flow."
+                                    )
+
+                                    session_state["person_type"] = "visitor"
+                                    person_type = "visitor"
+                                    session_action = "capture_reference"
+
+                                    # Re-run verification as a visitor to save their photo and log the visit
+                                    result = await loop.run_in_executor(
+                                        _face_executor,
+                                        lambda: verify_person_face(
+                                            person_type="visitor",
+                                            audio_name=audio_name,
+                                            image_b64=image_b64,
+                                        ),
+                                    )
+
+                                    # Process them exactly like a successful visitor capture
+                                    session_state["is_verified"] = True
+                                    session_state["visitor_captured"] = True
+                                    session_state["pending_identity_name"] = None
+                                    session_state["face_verify_in_progress"] = False
+                                    session_state["conversation_complete"] = True
+
+                                    try:
+                                        await websocket.send_text(
+                                            json.dumps(
+                                                {
+                                                    "type": "face_verification_result",
+                                                    "verified": result.get(
+                                                        "verified", True
+                                                    ),
+                                                    "distance": result.get(
+                                                        "distance", -1.0
+                                                    ),
+                                                    "audio_name": audio_name,
+                                                    "has_photo": result.get(
+                                                        "has_photo", True
+                                                    ),
+                                                    "message": result.get(
+                                                        "message", ""
+                                                    ),
+                                                    "person_type": "visitor",
+                                                    "session_action": "capture_reference",
+                                                    "reference_captured": True,
+                                                    "is_new": result.get(
+                                                        "is_new", True
+                                                    ),
+                                                    "visitor_id": result.get(
+                                                        "visitor_id"
+                                                    ),
+                                                }
+                                            )
+                                        )
+                                    except Exception as e:
+                                        logger.warning(
+                                            f"[{client_id}] Could not send visitor fallback result. Error: {e}"
+                                        )
+                                        break
+
+                                    pending_text = session_state.get("pending_text")
+                                    if pending_text:
+                                        session_state["mode"] = "PROCESSING"
+                                        await websocket.send_text(
+                                            json.dumps({"state": "processing"})
+                                        )
+                                        await text_queue.put(pending_text)
+                                        session_state["pending_text"] = None
+                                    else:
+                                        session_state["mode"] = "PASSIVE"
+                                        await websocket.send_text(
+                                            json.dumps({"state": "passive"})
+                                        )
+
+                                    continue  # Skip the rest of the employee strike logic
+                            # ----------------------------------------------------
+
                             session_state["face_verify_in_progress"] = False
                             if result.get("verified"):
                                 session_state["is_verified"] = True
@@ -631,11 +789,27 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                 # (it was parked at +3600 while we waited for the camera frame)
                                 followup_entered_at = time.time()
                             elif person_type == "employee":
+                                result["message"] = (
+                                    f"I wasn't able to verify you as {audio_name} from our employee records. "
+                                    f"I'll check you in as a visitor — could you let me know who you're here to meet?"
+                                )
                                 session_state["is_verified"] = False
-                                session_state["pending_identity_name"] = audio_name
-                                # Restart the clock even on mismatch so the user gets a
-                                # chance to hear the rejection message and try again
+                                # Name matched an employee but face didn't — treat as visitor
+                                # mark_employee_from_face_result already set is_employee=False in query_router state
+                                # Now flip this session to visitor mode so the visitor flow takes over
+                                session_state["person_type"] = "visitor"
+                                session_state["pending_identity_name"] = None
+                                session_state["claimed_name"] = (
+                                    audio_name  # <--- ADD THIS   # stop re-asking for face
+                                )
+                                session_state["visitor_captured"] = (
+                                    False  # allow visitor photo capture
+                                )
                                 followup_entered_at = time.time()
+                                logger.info(
+                                    f"[{client_id}] Employee face mismatch for '{audio_name}' — "
+                                    f"switching to visitor flow."
+                                )
 
                             logger.info(
                                 f"[{client_id}] Face verify result for '{audio_name}': "
@@ -786,20 +960,31 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
 
                 elif session_state["mode"] in ("ACTIVE", "FOLLOWUP"):
                     # Time out back to PASSIVE if they don't say anything
+                    # Time out back to PASSIVE if they don't say anything
                     if (
                         current_mode == "FOLLOWUP"
                         and not speech_seen
-                        and not session_state.get("brain_is_thinking")  # ← ADD
+                        and not session_state.get("brain_is_thinking")
                         and (
                             time.time() - followup_entered_at > FOLLOWUP_TIMEOUT_SECONDS
                         )
                     ):
+                        # --- NEW: Prevent timeout if waiting for Slack ---
+                        from services.query_router import (
+                            get_session_state as _get_router_state,
+                        )
+
+                        r_state = _get_router_state(client_id)
+                        if r_state.get("awaiting_slack_reply"):
+                            # Keep waiting. Reset the clock so we don't loop tightly.
+                            followup_entered_at = time.time()
+                            continue
+                        # -------------------------------------------------
+
                         logger.info(
                             f"[{client_id}] Followup timeout reached (no speech detected). Returning to PASSIVE."
                         )
-                        session_state["conversation_complete"] = (
-                            True  # Stop face frames immediately
-                        )
+                        session_state["conversation_complete"] = True
                         session_state["mode"] = "PASSIVE"
                         session_state["awaiting_face"] = False
                         await websocket.send_text(json.dumps({"state": "passive"}))
@@ -894,65 +1079,59 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                                                 f"[{client_id}] Face tracking was lost. Re-verifying known user: '{employee_name}'"
                                             )
                                         else:
-                                            detected_person_type = _detect_person_type(
-                                                text
-                                            )
-                                            session_state["person_type"] = (
-                                                detected_person_type
-                                            )
-
                                             candidates = (
                                                 _candidate_names_from_transcript(text)
                                             )
                                             loop = asyncio.get_event_loop()
+                                            employee_name = None
 
-                                            if detected_person_type == "visitor":
-                                                # For visitors, only use the extracted name if it came
-                                                # from an explicit self-introduction phrase
-                                                # ("I am X", "my name is X", etc.).
-                                                # The capitalized-word fallback can pick up the host
-                                                # name ("schedule a meeting with Lucy" → "Lucy"),
-                                                # so we re-run the strict extractor on safe_text only.
-                                                safe_text_for_name = re.sub(
-                                                    r"\b(?:meet|see|looking for|appointment with|meeting with|schedule\s+\w+\s+with|here for|here to meet|visiting|talk to|speak to|speak with)\s+([A-Z][a-z.\'-]+)\b",
-                                                    "",
-                                                    text,
-                                                    flags=re.IGNORECASE,
+                                            # 1. ALWAYS check the DB first for any extracted name
+                                            for candidate in candidates:
+                                                found_name = await loop.run_in_executor(
+                                                    _face_executor,
+                                                    _resolve_employee_name,
+                                                    candidate,
                                                 )
-                                                strict_name = _extract_spoken_name(
-                                                    safe_text_for_name
-                                                )
-                                                if strict_name:
-                                                    employee_name = strict_name
+                                                if found_name:
+                                                    employee_name = found_name
+                                                    session_state["person_type"] = (
+                                                        "employee"
+                                                    )
                                                     logger.info(
-                                                        f"[{client_id}] Visitor detected. "
-                                                        f"Speaker name extracted: '{employee_name}' "
-                                                        f"(skipping DB lookup)"
+                                                        f"[{client_id}] Name '{found_name}' found in DB. Categorizing as employee for face check."
                                                     )
-                                                else:
-                                                    # No explicit self-intro found — don't guess a name.
-                                                    # The LLM will ask for it naturally.
-                                                    employee_name = None
-                                                    logger.info(
-                                                        f"[{client_id}] Visitor detected but no explicit "
-                                                        f"self-introduction found — skipping name extraction."
-                                                    )
-                                            else:
-                                                for candidate in candidates:
-                                                    employee_name = (
-                                                        await loop.run_in_executor(
-                                                            _face_executor,
-                                                            _resolve_employee_name,
-                                                            candidate,
-                                                        )
-                                                    )
-                                                    if employee_name:
-                                                        logger.info(
-                                                            f"[{client_id}] Employee identified from candidate '{candidate}' as '{employee_name}'"
-                                                        )
-                                                        break
+                                                    break
 
-                                    # If we found a name, trigger face capture/verification
+                                            # 2. If NOT found in DB, treat them as a visitor
+                                            if not employee_name:
+                                                from services.query_router import (
+                                                    get_session_state as _get_router_state,
+                                                )
+
+                                                router_state = _get_router_state(
+                                                    client_id
+                                                )
+                                                known_visitor = router_state.get(
+                                                    "visitor_name"
+                                                )
+
+                                                if known_visitor:
+                                                    employee_name = known_visitor
+                                                    session_state["person_type"] = (
+                                                        "visitor"
+                                                    )
+                                                    logger.info(
+                                                        f"[{client_id}] Visitor already known as '{known_visitor}' from router state."
+                                                    )
+                                                elif candidates:
+                                                    employee_name = candidates[0]
+                                                    session_state["person_type"] = (
+                                                        "visitor"
+                                                    )
+                                                    logger.info(
+                                                        f"[{client_id}] Name '{employee_name}' not in DB. Categorizing as visitor."
+                                                    )
+
                                     # If we found a name, trigger face capture/verification
                                     if employee_name:
                                         person_type = session_state["person_type"]
@@ -1034,6 +1213,8 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                         "SYSTEM:Please complete face verification before continuing.",
                     )
                     and not text.startswith("SYSTEM:")
+                    and not text.startswith("SLACK_REPLY:")
+                    and not text.startswith("RESEND_REPLY:")
                 ):
                     text_lower = text.lower()
                     if any(
@@ -1047,29 +1228,59 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                 manager.client_state[client_id] = "THINKING"
                 session_state["brain_is_thinking"] = True
 
-                # --- BYPASS LLM FOR SYSTEM MESSAGES ---
-                if text and text.startswith("SYSTEM:"):
-                    reply_text = text.split("SYSTEM:", 1)[1]
-                else:
-                    # --- INJECT USER IDENTITY INTO LLM PROMPT ---
-                    verified_name = session_state.get("verified_name")
-                    if verified_name:
-                        # Secretly tell the LLM who is speaking
-                        prompt_text = f"[System Note: The user speaking is verified as {verified_name}] {text}"
-                    else:
-                        prompt_text = text
-
-                    reply_text = await process_text_for_client(client_id, prompt_text)
-                    session_state["brain_is_thinking"] = False
-
-                logger.info(f"[{client_id}] AI Response generated: '{reply_text}'")
-
-                # --- THE TRY BLOCK STARTS HERE ---
+                # --- THE TRY BLOCK NOW WRAPS EVERYTHING (FIX #2) ---
+                # Previously the try only wrapped TTS/audio sending.
+                # If process_text_for_client raised on the SLACK_REPLY path,
+                # task_done() was never called and the queue jammed permanently.
                 try:
+                    # --- RESEND: re-deliver a reply that was dropped due to disconnect ---
+                    if text and text.startswith("RESEND_REPLY:"):
+                        reply_text = text.split("RESEND_REPLY:", 1)[1]
+                        session_state["mode"] = "FOLLOWUP"
+                        logger.info(f"[{client_id}] Re-speaking undelivered reply.")
+
+                    # --- BYPASS LLM FOR SLACK REPLY SENTINELS ---
+                    elif text and text.startswith("SLACK_REPLY:"):
+                        # Force mode back to FOLLOWUP so the session is "alive"
+                        # when brain() tries to send audio back to the user.
+                        session_state["mode"] = "FOLLOWUP"
+                        reply_text = await process_text_for_client(client_id, text)
+
+                    # --- BYPASS LLM FOR SYSTEM MESSAGES ---
+                    elif text and text.startswith("SYSTEM:"):
+                        reply_text = text.split("SYSTEM:", 1)[1]
+
+                    else:
+                        # --- INJECT USER IDENTITY INTO LLM PROMPT ---
+                        verified_name = session_state.get("verified_name")
+                        if verified_name:
+                            prompt_text = f"[System Note: The user speaking is verified as {verified_name}] {text}"
+                        else:
+                            prompt_text = text
+
+                        reply_text = await process_text_for_client(
+                            client_id, prompt_text
+                        )
+
+                    logger.info(f"[{client_id}] AI Response generated: '{reply_text}'")
+
                     if not reply_text or not reply_text.strip():
                         session_state["mode"] = "PASSIVE"
                         await websocket.send_text(json.dumps({"state": "passive"}))
                         continue
+
+                    # ── FIX: Save reply into router state BEFORE attempting to send
+                    # audio. If the WebSocket dies mid-send, the reconnect handler
+                    # will find this and re-inject it via RESEND_REPLY so the user
+                    # actually hears what Jarvis wanted to say.
+                    try:
+                        from services.query_router import get_session_state as _gss
+
+                        _router_state = _gss(client_id)
+                        _router_state["_pending_reply"] = reply_text
+                    except Exception:
+                        pass
+                    # ────────────────────────────────────────────────────────────
 
                     audio, word_timings = (
                         await tts_processor.synthesize_remaining_speech_with_timing(
@@ -1097,6 +1308,16 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                         # Wait for audio to physically finish playing on the frontend
                         await asyncio.sleep((len(audio) / 24000.0) + 0.5)
 
+                    # ── FIX: Audio delivered successfully — clear the pending reply ─
+                    try:
+                        from services.query_router import get_session_state as _gss
+
+                        _router_state = _gss(client_id)
+                        _router_state.pop("_pending_reply", None)
+                    except Exception:
+                        pass
+                    # ────────────────────────────────────────────────────────────────
+
                     # --- 2. ROUTE TO CORRECT MODE ---
                     if is_terminal:
                         logger.info(
@@ -1112,30 +1333,124 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                     # --------------------------------
 
                 except (RuntimeError, WebSocketDisconnect):
-                    # This catches the error if the user closes the tab
                     logger.info(
                         f"[{client_id}] Client disconnected before AI could finish responding."
                     )
+                    # _pending_reply is intentionally NOT cleared here — it will be
+                    # re-delivered on the next reconnect via RESEND_REPLY.
                     break
                 finally:
                     session_state["brain_is_thinking"] = False
-                    # This ensures the queue is ALWAYS marked as done, even if it errors or continues
+                    # task_done() now ALWAYS runs — no matter which branch above
+                    # was taken, and no matter whether an exception was raised.
                     text_queue.task_done()
 
-        listener_task = asyncio.create_task(listener())
-        brain_task = asyncio.create_task(brain())
-        keepalive_task = asyncio.create_task(send_keepalive())
+        async def slack_watcher():
+            """
+            Polls Slack's API directly every 3 seconds for a reply in the
+            thread that was opened for this session.
+            No webhook, no tunnel, no Events API required.
+            """
+            from services.slack_reply_poller import poll_for_reply
+            from services.query_router import get_session_state as _get_state
 
-        # Only listener or brain dying should end the session
-        # Keepalive dying alone must NOT kill everything
-        await asyncio.wait(
-            [listener_task, brain_task], return_when=asyncio.FIRST_COMPLETED
-        )
-        keepalive_task.cancel()
+            POLL_INTERVAL = 3
+            MAX_WAIT = 120
+
+            logger.info(f"[{client_id}] slack_watcher STARTED")
+            elapsed = 0
+
+            while True:
+                await asyncio.sleep(POLL_INTERVAL)
+
+                try:
+                    state = _get_state(client_id)
+                except Exception as e:
+                    logger.warning(
+                        f"[{client_id}] slack_watcher: session gone ({e}), stopping."
+                    )
+                    break
+
+                if not state.get("awaiting_slack_reply"):
+                    continue
+
+                elapsed += POLL_INTERVAL
+
+                if elapsed >= MAX_WAIT:
+                    logger.info(
+                        f"[{client_id}] slack_watcher: no reply after {MAX_WAIT}s, giving up."
+                    )
+                    state["awaiting_slack_reply"] = False
+                    elapsed = 0
+                    continue
+
+                session_id = state.get("session_id")
+                if not session_id:
+                    continue
+
+                # Poll Slack API directly — no webhook needed
+                result = await poll_for_reply(session_id)
+                if not result:
+                    continue
+
+                sender_name, reply_text = result
+                elapsed = 0
+
+                logger.info(
+                    f"[{client_id}] slack_watcher REPLY from '{sender_name}': {reply_text}"
+                )
+
+                # Interrupt frontend and inject into brain()
+                await websocket.send_json({"type": "interrupt_listening"})
+                await text_queue.put(f"SLACK_REPLY:{sender_name}:{reply_text}")
+
+            logger.info(f"[{client_id}] slack_watcher exiting.")
+
+        io_tasks = [
+            asyncio.create_task(listener()),
+            asyncio.create_task(send_keepalive()),
+        ]
+        brain_task = asyncio.create_task(brain())
+        watcher_task = asyncio.create_task(slack_watcher())
+
+        await asyncio.wait(io_tasks, return_when=asyncio.FIRST_COMPLETED)
+
+        for t in io_tasks:
+            t.cancel()
+
+        from services.query_router import get_session_state as _qs
+
         try:
-            await keepalive_task
-        except asyncio.CancelledError:
+            _state = _qs(client_id)
+            still_waiting = _state.get("awaiting_slack_reply", False)
+        except Exception:
+            still_waiting = False
+
+        if still_waiting and not brain_task.done() and not watcher_task.done():
+            await asyncio.wait(
+                [brain_task, watcher_task],
+                return_when=asyncio.ALL_COMPLETED,
+                timeout=120,
+            )
+
+        # ✅ Only cancel watcher if NOT still waiting for Slack reply
+        try:
+            await asyncio.wait_for(text_queue.join(), timeout=5.0)
+        except asyncio.TimeoutError:
             pass
+        brain_task.cancel()
+
+        try:
+            _state = _qs(client_id)
+            if not _state.get("awaiting_slack_reply"):
+                watcher_task.cancel()
+            else:
+                logger.info(
+                    f"[{client_id}] Keeping watcher alive — still awaiting Slack reply."
+                )
+        except Exception:
+            watcher_task.cancel()
+
     finally:
         await manager.cancel_current_tasks(client_id)
         manager.disconnect(client_id)

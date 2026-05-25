@@ -6,12 +6,10 @@ SERVER_DIR = Path(__file__).resolve().parent
 SERVER_DIR_STR = str(SERVER_DIR)
 if SERVER_DIR_STR not in sys.path:
     sys.path.insert(0, SERVER_DIR_STR)
-
 import torch
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-
 from core.config import logger
 from core.lifespan import lifespan
 
@@ -31,6 +29,8 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:3000",
         "http://127.0.0.1:3000",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -68,18 +68,28 @@ async def reset_session(client_id: str):
     return {"status": "cleared"}
 
 
+@app.post("/test-challenge")
+async def test_challenge(request: Request):
+    payload = await request.json()
+    return {"challenge": payload.get("challenge", "ok")}
+
+
 # Include routes after dispatcher is defined
 from routes.api_routes import router as api_router
 from routes.websocket_routes import router as websocket_router
 from routes.employee_routes import (
     router as employee_router,
 )  # Employee photo upload API
+from routes.dashboard_routes import router as dashboard_router  # Dashboard API
 
 app.include_router(api_router)
 app.include_router(websocket_router)
 app.include_router(
     employee_router, prefix="/api"
 )  # Registers GET/POST /api/employees/*
+app.include_router(
+    dashboard_router, prefix="/api/dashboard"
+)  # Registers GET/POST /api/dashboard/*
 
 
 def main():
