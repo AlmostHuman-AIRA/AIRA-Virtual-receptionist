@@ -188,6 +188,11 @@ _VISITOR_KEYWORDS = (
     "onboarding",
     "appointment",
     "visiting",
+    "client",
+    "sales demo",
+    "demo",
+    "sales meeting",
+    "here for a",
 )
 
 
