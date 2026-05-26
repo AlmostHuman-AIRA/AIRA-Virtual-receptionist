@@ -44,8 +44,9 @@ def _build_extract_system() -> str:
 {{
   "intent": "check_in" | "schedule_meeting" | "employee_lookup" | "confirm" | "general",
   "entities": {{
-    "visitor_name": string, "employee_name": string, "date": "YYYY-MM-DD or null",
-    "time": "HH:MM (24h) or null", "purpose": string, "visitor_type": string, "email": string
+    "visitor_name": string, "employee_name": string, "employee_role": string,
+    "date": "YYYY-MM-DD or null", "time": "HH:MM (24h) or null",
+    "purpose": string, "visitor_type": string, "email": string
   }}
 }}
 
@@ -64,6 +65,10 @@ INTENT CLASSIFICATION RULES:
 - "confirm"         : Saying yes, correct, or "schedule it".
 - "general"         : Greetings or small talk.
 
+EMPLOYEE_ROLE EXTRACTION RULE:
+- Extract any job title or role mentioned alongside the employee name (e.g. "sales director", "HR manager", "CEO").
+- If no role is mentioned, return null.
+
 VISITOR TYPE CATEGORIES (MUST BE ONE OF THESE):
 - "Employee"          : Staff members, managers, or anyone who says "I work here".
 - "Delivery"          : Amazon, Flipkart, DHL, or general package couriers.
@@ -77,16 +82,19 @@ VISITOR TYPE CATEGORIES (MUST BE ONE OF THESE):
 FEW-SHOT EXAMPLES:
 
 Input: "I am Priya and I am an employee here."
-Output: {{"intent": "check_in", "entities": {{"visitor_name": "Priya", "employee_name": null, "date": null, "time": null, "purpose": "reporting for work", "visitor_type": "Employee", "email": null}}}}
+Output: {{"intent": "check_in", "entities": {{"visitor_name": "Priya", "employee_name": null, "employee_role": null, "date": null, "time": null, "purpose": "reporting for work", "visitor_type": "Employee", "email": null}}}}
 
 Input: "I'm from Amazon to drop off a parcel for Virat."
-Output: {{"intent": "check_in", "entities": {{"visitor_name": "Amazon", "employee_name": "Virat", "date": null, "time": null, "purpose": "parcel delivery", "visitor_type": "Delivery", "email": null}}}}
+Output: {{"intent": "check_in", "entities": {{"visitor_name": "Amazon", "employee_name": "Virat", "employee_role": null, "date": null, "time": null, "purpose": "parcel delivery", "visitor_type": "Delivery", "email": null}}}}
+
+Input: "I'm Srishti and I have a meeting with sales director Jack."
+Output: {{"intent": "check_in", "entities": {{"visitor_name": "Srishti", "employee_name": "Jack", "employee_role": "Sales Director", "date": null, "time": null, "purpose": "meeting", "visitor_type": "Visitor/Guest", "email": null}}}}
 
 Input: "Yes, please schedule that for 5 p.m. today."
-Output: {{"intent": "confirm", "entities": {{"visitor_name": null, "employee_name": null, "date": "{today.strftime('%Y-%m-%d')}", "time": "17:00", "purpose": null, "visitor_type": null, "email": null}}}}
+Output: {{"intent": "confirm", "entities": {{"visitor_name": null, "employee_name": null, "employee_role": null, "date": "{today.strftime('%Y-%m-%d')}", "time": "17:00", "purpose": null, "visitor_type": null, "email": null}}}}
 
 Input: "Next Friday at 11 a.m."
-Output: {{"intent": "confirm", "entities": {{"visitor_name": null, "employee_name": null, "date": "{next_friday.strftime('%Y-%m-%d')}", "time": "11:00", "purpose": null, "visitor_type": null, "email": null}}}}
+Output: {{"intent": "confirm", "entities": {{"visitor_name": null, "employee_name": null, "employee_role": null, "date": "{next_friday.strftime('%Y-%m-%d')}", "time": "11:00", "purpose": null, "visitor_type": null, "email": null}}}}
 """
 
 

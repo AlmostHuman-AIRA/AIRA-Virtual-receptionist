@@ -13,6 +13,7 @@ from receptionist.database import (
     get_available_slots,
     schedule_meeting,
     get_employee_by_name,
+    get_similar_employee,
 )
 from receptionist.models import Employee, Visitor, Meeting, ReceptionLog
 from models.groq_processor import BASE_SYSTEM_PROMPT, GroqProcessor
@@ -344,7 +345,7 @@ def _lookup_employee(search_term: str) -> Optional[Employee]:
         str(search_term).lower(),
     ).strip()
     for key, dept in SEMANTIC_MAP.items():
-        if key in clean:
+        if re.search(r"\b" + re.escape(key) + r"\b", clean):
             clean = dept
             break
     if clean in ["admin", "administration", "front desk", "anyone"]:
@@ -574,6 +575,7 @@ def _merge_checkin_entities(
     state["visitor_type"] = _determine_visitor_type(
         user_query, entities.get("purpose", ""), state["visitor_type"]
     )
+
     # ── MULTI-HOST EXTRACTION ────────────────────────────────────────────────
     raw_targets: List[str] = []
 
@@ -617,12 +619,33 @@ def _merge_checkin_entities(
     if not unique_targets and state.get("meeting_with_raw"):
         unique_targets = [state["meeting_with_raw"]]
 
+    # ── HOST RESOLUTION (fixed) ───────────────────────────────────────────────
+    # Priority order:
+    #   1. get_employee_by_name()   — exact / prefix / 85% fuzzy on NAME only
+    #   2. get_similar_employee()   — word-in-name + 55% fuzzy fallback
+    #   3. _lookup_employee()       — last resort: role/department semantic search
+    #                                 (kept for inputs like "the AC guy" or "HR")
+    # This prevents SEMANTIC_MAP corrupting plain person names like "Jack"
+    # (e.g. "jack" contains "ac" → previously replaced with "Operations").
     resolved_hosts: List[str] = []
     primary_emp = None
     for target in unique_targets:
         if _is_jarvis(target):
             continue
-        emp = _lookup_employee(target)
+
+        # 1. Strict name lookup (exact → prefix → high-cutoff fuzzy)
+        emp = get_employee_by_name(target)
+
+        # 2. Word-in-name + looser fuzzy (catches "Jack" inside "Jack Smith")
+        if not emp:
+            emp = get_similar_employee(target)
+
+        # 3. Semantic/role/department fallback (for non-name inputs)
+        if not emp:
+            emp = _lookup_employee(target)
+
+        logger.debug(f"[host-resolve] '{target}' → '{emp.name if emp else None}'")
+
         if emp:
             if emp.name not in resolved_hosts:
                 resolved_hosts.append(emp.name)
