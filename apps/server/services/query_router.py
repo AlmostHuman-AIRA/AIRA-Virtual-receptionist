@@ -14,6 +14,7 @@ from receptionist.database import (
     schedule_meeting,
     get_employee_by_name,
     get_similar_employee,
+    ALL_SLOTS_1H,
 )
 from receptionist.models import Employee, Visitor, Meeting, ReceptionLog
 from models.groq_processor import BASE_SYSTEM_PROMPT, GroqProcessor
@@ -189,6 +190,7 @@ def _fresh_state() -> Dict[str, Any]:
         "sched_purpose": None,
         "identity_updated": False,
         "notified_hosts": set(),
+        "declined_hosts": set(),
         "all_hosts": [],  # list of all resolved host names to notify
         "greeted": False,
         "force_admin": False,
@@ -379,59 +381,62 @@ def _notify_host_pending(state: Dict[str, Any]) -> bool:
     db = SessionLocal()
     try:
         v_name = state.get("visitor_name") or "Guest"
-        host_name = state["sched_employee_name"]
-        emp = _lookup_employee(host_name)
-        narrative = _format_descriptive_purpose(state, "SCHEDULED")
-        mid = schedule_meeting(
-            v_name,
-            "Visitor",
-            host_name,
-            state["sched_date"],
-            state["sched_time"],
-            narrative,
-        )
-        if mid == -1:
-            return -1  # conflict — slot already booked
-        if not mid:
-            return False  # other failure (employee not found, bad datetime, etc.)
+        all_hosts = state.get("all_hosts") or [state["sched_employee_name"]]
 
-        visitor = db.query(Visitor).filter(Visitor.name.ilike(v_name)).first()
-        if not visitor:
-            visitor = Visitor(name=v_name)
-            db.add(visitor)
-            db.flush()
+        for host_name in all_hosts:
+            if host_name in state["notified_hosts"]:
+                continue  # skip already-notified hosts
 
-        log = ReceptionLog(
-            visitor_id=visitor.id,
-            employee_id=emp.id if emp and emp.id else None,
-            person_type=state["visitor_type"],
-            purpose=narrative,
-            check_in_time=datetime.utcnow(),
-        )
-        db.add(log)
-        db.commit()
-        # ── FIX: Always fetch host email from DB, never trust state ──
-        db_emp = db.query(Employee).filter(Employee.name.ilike(host_name)).first()
-        host_email = (
-            db_emp.email
-            if db_emp and db_emp.email
-            else state.get("sched_employee_email", "")
-        )
-        # ─────────────────────────────────────────────────────────────
+            emp = _lookup_employee(host_name)
+            narrative = _format_descriptive_purpose(state, "SCHEDULED")
+            mid = schedule_meeting(
+                v_name,
+                "Visitor",
+                host_name,
+                state["sched_date"],
+                state["sched_time"],
+                narrative,
+            )
+            if mid == -1:
+                return -1  # conflict
+            if not mid:
+                return False
 
-        host_slack_user_id = get_slack_user_id_by_email(host_email)
-        send_slack_meeting_scheduled(
-            host_name=host_name,
-            host_email=host_email,
-            visitor_name=v_name,
-            date_str=state["sched_date"],
-            time_str=state["sched_time"],
-            purpose=state.get("sched_purpose") or state.get("purpose") or "Meeting",
-            session_id=state["session_id"],
-            host_slack_user_id=host_slack_user_id,
-        )
+            visitor = db.query(Visitor).filter(Visitor.name.ilike(v_name)).first()
+            if not visitor:
+                visitor = Visitor(name=v_name)
+                db.add(visitor)
+                db.flush()
 
-        state["notified_hosts"].add(host_name)
+            log = ReceptionLog(
+                visitor_id=visitor.id,
+                employee_id=emp.id if emp and emp.id else None,
+                person_type=state["visitor_type"],
+                purpose=narrative,
+                check_in_time=datetime.utcnow(),
+            )
+            db.add(log)
+            db.commit()
+
+            db_emp = db.query(Employee).filter(Employee.name.ilike(host_name)).first()
+            host_email = (
+                db_emp.email
+                if db_emp and db_emp.email
+                else state.get("sched_employee_email", "")
+            )
+            host_slack_user_id = get_slack_user_id_by_email(host_email)
+            send_slack_meeting_scheduled(
+                host_name=host_name,
+                host_email=host_email,
+                visitor_name=v_name,
+                date_str=state["sched_date"],
+                time_str=state["sched_time"],
+                purpose=state.get("sched_purpose") or state.get("purpose") or "Meeting",
+                session_id=state["session_id"],
+                host_slack_user_id=host_slack_user_id,
+            )
+            state["notified_hosts"].add(host_name)
+
         state["awaiting_slack_reply"] = True
         return True
     except Exception as e:
@@ -500,20 +505,16 @@ def _commit_checkin(state: Dict[str, Any]) -> bool:
                 visitor = Visitor(name=v_name)
                 db.add(visitor)
                 db.flush()
-            host_raw = state.get("meeting_with_resolved") or state.get(
-                "meeting_with_raw"
-            )
-            host_emp = _lookup_employee(host_raw)
+
             log = ReceptionLog(
                 visitor_id=visitor.id,
-                employee_id=host_emp.id if host_emp and host_emp.id else None,
+                employee_id=emp.id if emp and emp.id else None,
                 person_type=state["visitor_type"],
-                purpose=_format_descriptive_purpose(state),
+                purpose=narrative,
                 check_in_time=datetime.utcnow(),
             )
-
-        db.add(log)
-        db.commit()
+            db.add(log)
+            db.commit()
         return True
     except Exception as e:
         logger.error(f"Commit error: {e}")
@@ -580,12 +581,16 @@ def _merge_checkin_entities(
     raw_targets: List[str] = []
 
     # 1. From LLM entities (may already be a list)
+    # AFTER
     for key in ("employee_name", "employee_role", "employee_names"):
         val = entities.get(key)
         if isinstance(val, list):
             raw_targets.extend(val)
         elif val:
-            raw_targets.append(val)
+            for part in re.split(r"\s+and\s+|\s*,\s*", val, flags=re.IGNORECASE):
+                part = part.strip()
+                if part:
+                    raw_targets.append(part)
 
     # 2. Scan raw query for "with X and Y" patterns
     # Stops at noise words so "for me today" doesn't get captured
@@ -606,8 +611,8 @@ def _merge_checkin_entities(
             ):
                 raw_targets.append(part)
 
-    # Deduplicate while preserving order
-    seen_keys: set = set()
+        # Deduplicate while preserving order
+        seen_keys: set = set()
     unique_targets: List[str] = []
     for t in raw_targets:
         k = t.lower().strip()
@@ -615,56 +620,46 @@ def _merge_checkin_entities(
             seen_keys.add(k)
             unique_targets.append(t)
 
-    # Fallback to previously stored raw target only if nothing new found
-    if not unique_targets and state.get("meeting_with_raw"):
-        unique_targets = [state["meeting_with_raw"]]
-
     # ── HOST RESOLUTION (fixed) ───────────────────────────────────────────────
-    # Priority order:
-    #   1. get_employee_by_name()   — exact / prefix / 85% fuzzy on NAME only
-    #   2. get_similar_employee()   — word-in-name + 55% fuzzy fallback
-    #   3. _lookup_employee()       — last resort: role/department semantic search
-    #                                 (kept for inputs like "the AC guy" or "HR")
-    # This prevents SEMANTIC_MAP corrupting plain person names like "Jack"
-    # (e.g. "jack" contains "ac" → previously replaced with "Operations").
-    resolved_hosts: List[str] = []
-    primary_emp = None
-    for target in unique_targets:
-        if _is_jarvis(target):
-            continue
+    # Only run if new targets were identified in this turn.
+    # This prevents overwriting previous multi-host arrays when user just says "yes" or "confirm".
+    if unique_targets:
+        resolved_hosts: List[str] = []
+        primary_emp = None
 
-        # 1. Strict name lookup (exact → prefix → high-cutoff fuzzy)
-        emp = get_employee_by_name(target)
+        for target in unique_targets:
+            if _is_jarvis(target):
+                continue
 
-        # 2. Word-in-name + looser fuzzy (catches "Jack" inside "Jack Smith")
-        if not emp:
-            emp = get_similar_employee(target)
+            # 1. Strict name lookup (exact → prefix → high-cutoff fuzzy)
+            emp = get_employee_by_name(target)
 
-        # 3. Semantic/role/department fallback (for non-name inputs)
-        if not emp:
-            emp = _lookup_employee(target)
+            # 2. Word-in-name + looser fuzzy (catches "Jack" inside "Jack Smith")
+            if not emp:
+                emp = get_similar_employee(target)
 
-        logger.debug(f"[host-resolve] '{target}' → '{emp.name if emp else None}'")
+            # 3. Semantic/role/department fallback (for non-name inputs)
+            if not emp:
+                emp = _lookup_employee(target)
 
-        if emp:
-            if emp.name not in resolved_hosts:
-                resolved_hosts.append(emp.name)
-            if primary_emp is None:
-                primary_emp = emp
-        else:
-            if target not in resolved_hosts:
-                resolved_hosts.append(target)
+            logger.debug(f"[host-resolve] '{target}' → '{emp.name if emp else None}'")
 
-    if resolved_hosts:
-        state["meeting_with_raw"] = unique_targets[0]
-        state["meeting_with_resolved"] = resolved_hosts[0]
-        state["sched_employee_name"] = resolved_hosts[0]
-        if primary_emp:
-            state["sched_employee_email"] = primary_emp.email
-        # RESET all_hosts every time new hosts are extracted — prevents
-        # stale hosts from previous sessions bleeding in
-        state["all_hosts"] = resolved_hosts
-    # ─────────────────────────────────────────────────────────────────────────
+            if emp:
+                if emp.name not in resolved_hosts:
+                    resolved_hosts.append(emp.name)
+                if primary_emp is None:
+                    primary_emp = emp
+            else:
+                if target not in resolved_hosts:
+                    resolved_hosts.append(target)
+
+        if resolved_hosts:
+            state["meeting_with_raw"] = unique_targets[0]
+            state["meeting_with_resolved"] = resolved_hosts[0]
+            state["sched_employee_name"] = resolved_hosts[0]
+            if primary_emp:
+                state["sched_employee_email"] = primary_emp.email
+            state["all_hosts"] = resolved_hosts
 
     # ── Date / time / purpose ─────────────────────────────────────────────────
     if entities.get("date"):
@@ -837,6 +832,17 @@ async def _handle_scheduling(
         before_time=before_time,
     )
 
+    # ✅ Grace window: don't disqualify visitor's requested time due to
+    # processing delay (up to 15 mins tolerance)
+    requested = state.get("sched_time")
+    if requested and requested not in slots and requested in ALL_SLOTS_1H:
+        now_dt = datetime.strptime(datetime.now().strftime("%H:%M"), "%H:%M")
+        req_dt = datetime.strptime(requested, "%H:%M")
+        diff_minutes = (now_dt - req_dt).total_seconds() / 60
+        if diff_minutes <= 15:
+            slots.append(requested)
+            slots.sort()
+
     state.pop("sched_time_before", None)
     state.pop("sched_time_after", None)
     # --- 3. NEW: Trust the host's time even if outside normal DB hours ---
@@ -907,10 +913,12 @@ async def _handle_scheduling(
             state["conv_state"] = State.COMPLETED
             state["host_preapproved"] = False  # Clear state
 
-            host = state["sched_employee_name"]
+            hosts_display = " and ".join(
+                state.get("all_hosts") or [state["sched_employee_name"]]
+            )
             time_disp = _fmt_display(state["sched_time"])
             return await _llm_reply(
-                f"Tell the visitor their meeting is confirmed with {host} at {time_disp}. Ask them to wait.",
+                f"Tell the visitor their meeting is confirmed with {hosts_display} at {time_disp}. Ask them to wait.",
                 state,
                 query,
                 client_id,
@@ -929,10 +937,12 @@ async def _handle_scheduling(
             # Keep scheduling_active — session is NOT done yet.
             state["scheduling_active"] = True
             state["awaiting_slack_reply"] = True
-            host = state["sched_employee_name"]
+            hosts_display = " and ".join(
+                state.get("all_hosts") or [state["sched_employee_name"]]
+            )
             time = _fmt_display(state["sched_time"])
             return await _llm_reply(
-                f"Tell the visitor: 'I have notified {host} for {time}. "
+                f"Tell the visitor: 'I have notified {hosts_display} for {time}. "
                 f"Please give me a moment while I wait for their confirmation.'",
                 state,
                 query,
@@ -946,8 +956,11 @@ async def _handle_scheduling(
                 client_id,
             )
 
+    hosts_display = " and ".join(
+        state.get("all_hosts") or [state["sched_employee_name"]]
+    )
     return await _llm_reply(
-        f"Ask the visitor to confirm if they want to schedule the meeting with {state['sched_employee_name']} at {_fmt_display(state['sched_time'])}.",
+        f"Ask the visitor to confirm if they want to schedule the meeting with {hosts_display} at {_fmt_display(state['sched_time'])}.",
         state,
         query,
         client_id,
@@ -964,10 +977,8 @@ async def route_query(client_id: str, user_query: str) -> str:
 
     # Wake word → fresh session
     if any(x in query_low for x in WAKE_WORDS):
-        # --- NEW: Ignore wake word resets if waiting for Slack ---
         if state.get("awaiting_slack_reply"):
             return "I am still waiting for the host to reply. Please give me just a moment."
-        # ---------------------------------------------------------
 
         clear_session_state(client_id)
         state = get_session_state(client_id)
@@ -977,7 +988,7 @@ async def route_query(client_id: str, user_query: str) -> str:
             f"I am {AI_NAME}, how can I assist you today?"
         )
 
-    # ── 1. MOVED TO TOP: CHECK FOR PENDING SLACK REPLY ────────────────────────
+    # ── 1. CHECK FOR PENDING SLACK REPLY ─────────────────────────────────────
     if user_query.startswith("SLACK_REPLY:"):
         parts = user_query.split(":", 2)
         host_name = parts[1] if len(parts) > 1 else "Host"
@@ -1008,13 +1019,43 @@ async def route_query(client_id: str, user_query: str) -> str:
                 _book_calendar_event(state)
                 state["scheduling_active"] = False
                 state["conv_state"] = State.COMPLETED
+
+                # ✅ First responder wins — stop polling all other host threads
+                from services.slack_reply_poller import unregister_thread
+
+                unregister_thread(state["session_id"])
+
                 sched_display = _fmt_display(state.get("sched_time") or "")
+                all_hosts = state.get("all_hosts") or [host_name]
+                hosts_display = " and ".join(all_hosts)
                 situation = (
                     f"{host_name} confirmed the meeting. "
-                    f"Tell the visitor the meeting is confirmed "
-                    f"with {host_name} at {sched_display}."
+                    f"Tell the visitor the meeting is confirmed with {hosts_display} "
+                    f"at {sched_display}. Ask them to wait in the lobby."
                 )
+
             else:
+                # ✅ Mark this host as declined and check if others are still pending
+                state.setdefault("declined_hosts", set()).add(host_name)
+                remaining = [
+                    h
+                    for h in state.get("all_hosts", [])
+                    if h not in state["declined_hosts"]
+                ]
+
+                if remaining:
+                    # Other hosts haven't replied yet — keep waiting silently
+                    state["awaiting_slack_reply"] = True
+                    return await _llm_reply(
+                        f"{host_name} is unavailable at the requested time. "
+                        f"Still waiting for confirmation from {' and '.join(remaining)}. "
+                        f"Tell the visitor you are still checking with the other host(s).",
+                        state,
+                        "[System: Slack Reply Received]",
+                        client_id,
+                    )
+
+                # All hosts have declined — fall through to reschedule logic
                 time_match = re.search(
                     r"\b((?:1[0-2]|0?[1-9])(?::[0-5][0-9])?\s*(?:am|pm)?|(?:[01]?\d|2[0-3]):[0-5][0-9])\b",
                     slack_reply,
@@ -1025,9 +1066,6 @@ async def route_query(client_id: str, user_query: str) -> str:
                     constraint_time_24 = _normalize_time(time_match.group(1))
 
                     if constraint_time_24:
-                        reply_lower = slack_reply.lower()
-
-                        # --- 1. NEW: Update date based on Slack reply ---
                         today_str = datetime.now().strftime("%Y-%m-%d")
                         tomorrow_str = (datetime.now() + timedelta(days=1)).strftime(
                             "%Y-%m-%d"
@@ -1036,7 +1074,6 @@ async def route_query(client_id: str, user_query: str) -> str:
                             state["sched_date"] = today_str
                         elif "tomorrow" in reply_lower:
                             state["sched_date"] = tomorrow_str
-                        # ------------------------------------------------
 
                         before_match = re.search(r"\bbefore\b", reply_lower)
                         after_match = re.search(r"\b(after|from)\b", reply_lower)
@@ -1049,9 +1086,7 @@ async def route_query(client_id: str, user_query: str) -> str:
                             state["sched_time"] = None
                         else:
                             state["sched_time"] = constraint_time_24
-                            # --- 2. NEW: Mark as host pre-approved ---
                             state["host_preapproved"] = True
-                            # -----------------------------------------
 
                     constraint_desc = ""
                     if state.get("sched_time_before"):
@@ -1072,7 +1107,7 @@ async def route_query(client_id: str, user_query: str) -> str:
                     )
 
                 else:
-                    # ← correct level: no time found in host's reply at all → soft decline
+                    # No time found in reply at all → soft decline
                     state["scheduling_active"] = False
                     state["awaiting_slack_reply"] = False
                     situation = (
@@ -1085,7 +1120,12 @@ async def route_query(client_id: str, user_query: str) -> str:
                     situation, state, "[System: Slack Reply Received]", client_id
                 )
 
-        # Non-scheduling flow
+            # Reached only on host_confirmed path
+            return await _llm_reply(
+                situation, state, "[System: Slack Reply Received]", client_id
+            )
+
+        # Non-scheduling flow (arrival notification reply)
         situation = (
             f"{host_name} replied via Slack with the following message: "
             f'"{slack_reply}". '
@@ -1096,20 +1136,19 @@ async def route_query(client_id: str, user_query: str) -> str:
         )
     # ─────────────────────────────────────────────────────────────────────────
 
-    # ── 2. ONLY RUN ENTITY EXTRACTION ON ACTUAL USER SPEECH ──────────────────
+    # ── 2. ENTITY EXTRACTION ON ACTUAL USER SPEECH ───────────────────────────
     extracted = await llm.extract_intent_and_entities(user_query)
     intent = extracted.get("intent", "general")
     entities = extracted.get("entities", {})
     _merge_checkin_entities(state, entities, user_query)
+    logger.info(f"DEBUG all_hosts after merge = {state.get('all_hosts')}")
+    logger.info(f"DEBUG entities from LLM = {entities}")
 
-    # ... (The rest of your existing route_query logic remains exactly the same below this line) ...
     if any(
         x in query_low for x in ["don't know", "do not know", "anyone", "notify admin"]
     ):
         state["force_admin"] = True
         state["meeting_with_resolved"] = "Administration Team"
-
-    # ... etc ...
 
     is_farewell = any(w in query_low for w in ["thank you", "thanks", "bye", "goodbye"])
     if is_farewell:
@@ -1127,7 +1166,7 @@ async def route_query(client_id: str, user_query: str) -> str:
                     "book",
                 ]
             ):
-                pass  # Let it fall through to scheduling confirmation
+                pass  # fall through to scheduling confirmation
             else:
                 reply = await _llm_reply(
                     "Give a single warm farewell sentence. Use the visitor's name if you know it. Do NOT list multiple options.",
@@ -1178,13 +1217,6 @@ async def route_query(client_id: str, user_query: str) -> str:
 
     if intent == "schedule_meeting" or state["scheduling_active"]:
         state["scheduling_active"] = True
-        if (
-            state["visitor_name"]
-            and state["sched_employee_name"]
-            and state["sched_date"]
-            and state["sched_time"]
-        ):
-            return await _handle_scheduling(client_id, user_query, state, intent)
         return await _handle_scheduling(client_id, user_query, state, intent)
 
     if intent == "check_in" or state["meeting_with_resolved"]:

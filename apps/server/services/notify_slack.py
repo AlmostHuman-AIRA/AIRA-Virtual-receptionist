@@ -218,14 +218,17 @@ def send_slack_meeting_scheduled(
                 host_email,
             )
 
+    # AFTER — include host_name in the key
     with _notify_lock:
-        key = f"meeting_{session_id}"
+        key = f"meeting_{session_id}_{host_name}"  # ← per-host key
         new_value = f"{visitor_name}_{date_str}_{time_str}"
         is_reschedule = key in _last_notified and _last_notified.get(key) != new_value
 
         if _last_notified.get(key) == new_value:
             logger.warning(
-                "Blocking duplicate meeting notification for %s", visitor_name
+                "Blocking duplicate meeting notification for %s (%s)",
+                visitor_name,
+                host_name,
             )
             return
         _last_notified[key] = new_value
@@ -399,8 +402,12 @@ def clear_session(session_id: str):
 
     unregister_thread(session_id)
     with _notify_lock:
+        # AFTER
         keys_to_remove = [
-            k for k in _last_notified if k == session_id or k == f"meeting_{session_id}"
+            k
+            for k in _last_notified
+            if k == session_id
+            or k.startswith(f"meeting_{session_id}")  # ← startswith catches all hosts
         ]
         for k in keys_to_remove:
             _last_notified.pop(k, None)
