@@ -483,6 +483,7 @@ def _commit_checkin(state: Dict[str, Any]) -> bool:
     try:
         is_employee = state.get("is_employee", False)
         v_name = state.get("visitor_name") or "Guest"
+        narrative = _format_descriptive_purpose(state)
 
         if is_employee:
             # ── EMPLOYEE check-in: no visitor record, link directly to employee ──
@@ -495,7 +496,7 @@ def _commit_checkin(state: Dict[str, Any]) -> bool:
                 visitor_id=None,  # employees are NOT stored in visitors table
                 employee_id=emp_id,
                 person_type="Employee",
-                purpose=_format_descriptive_purpose(state),
+                purpose=narrative,
                 check_in_time=datetime.utcnow(),
             )
         else:
@@ -506,6 +507,10 @@ def _commit_checkin(state: Dict[str, Any]) -> bool:
                 db.add(visitor)
                 db.flush()
 
+            # Resolve the host employee for the log entry
+            host_name = state.get("meeting_with_resolved")
+            emp = _lookup_employee(host_name) if host_name else None
+
             log = ReceptionLog(
                 visitor_id=visitor.id,
                 employee_id=emp.id if emp and emp.id else None,
@@ -513,11 +518,16 @@ def _commit_checkin(state: Dict[str, Any]) -> bool:
                 purpose=narrative,
                 check_in_time=datetime.utcnow(),
             )
-            db.add(log)
-            db.commit()
+
+        db.add(log)
+        db.commit()
+        logger.info(
+            f"Reception log created: id={log.id}, visitor={v_name}, type={log.person_type}"
+        )
         return True
     except Exception as e:
         logger.error(f"Commit error: {e}")
+        db.rollback()
         return False
     finally:
         db.close()
@@ -611,8 +621,8 @@ def _merge_checkin_entities(
             ):
                 raw_targets.append(part)
 
-        # Deduplicate while preserving order
-        seen_keys: set = set()
+    # Deduplicate while preserving order
+    seen_keys: set = set()
     unique_targets: List[str] = []
     for t in raw_targets:
         k = t.lower().strip()
@@ -1101,9 +1111,12 @@ async def route_query(client_id: str, user_query: str) -> str:
                         constraint_desc = f"at {_fmt_display(state['sched_time'])}"
 
                     situation = (
-                        f'{host_name} replied via Slack: "{slack_reply}". '
+                        f"{host_name} responded to the scheduling request. "
+                        f'Their reply indicates: "{slack_reply}". '
                         f"{'The host proposes a time ' + constraint_desc + '. ' if constraint_desc else ''}"
-                        f"Ask the visitor if this works or relay the message naturally."
+                        f"Understand their intent and respond to the visitor professionally. "
+                        f"Do NOT quote the host's raw message. Instead, paraphrase their response naturally "
+                        f"(e.g. say '{host_name} suggested...' or '{host_name} is available at...')."
                     )
 
                 else:
@@ -1111,8 +1124,12 @@ async def route_query(client_id: str, user_query: str) -> str:
                     state["scheduling_active"] = False
                     state["awaiting_slack_reply"] = False
                     situation = (
-                        f'{host_name} replied via Slack: "{slack_reply}". '
-                        f"Relay this to the visitor naturally. If it seems like a decline or unavailability, "
+                        f"{host_name} responded to the scheduling request. "
+                        f'Their reply indicates: "{slack_reply}". '
+                        f"Understand their intent and respond to the visitor professionally. "
+                        f"Do NOT quote the host's raw message directly. Instead, interpret their response "
+                        f"and communicate the meaning naturally (e.g. '{host_name} is currently unavailable' "
+                        f"or '{host_name} suggested an alternative'). If it seems like a decline, "
                         f"apologize and offer to reschedule or contact someone else."
                     )
 
@@ -1127,9 +1144,13 @@ async def route_query(client_id: str, user_query: str) -> str:
 
         # Non-scheduling flow (arrival notification reply)
         situation = (
-            f"{host_name} replied via Slack with the following message: "
-            f'"{slack_reply}". '
-            f"Relay this message naturally and helpfully to the visitor."
+            f"{host_name} responded via Slack. "
+            f'Their reply indicates: "{slack_reply}". '
+            f"Understand the intent of their reply and respond to the visitor professionally. "
+            f"Do NOT quote the host's raw message directly. Instead, interpret what they said "
+            f"and communicate it naturally (e.g. if they said 'ok I will collect it', say "
+            f"'{host_name} has confirmed and will come to collect it shortly'). "
+            f"Be helpful and keep the response concise."
         )
         return await _llm_reply(
             situation, state, "[System: Slack Reply Received]", client_id
